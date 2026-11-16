@@ -18,6 +18,7 @@ import argparse
 import datetime as dt
 import json
 import re
+import signal
 import subprocess
 import sys
 import time
@@ -279,6 +280,90 @@ def _check_run_network_loads(env) -> bool:
     return False
 
 
+# A trivial BNG .net -- one species, one degradation reaction -- used only to
+# exercise bngsim's native core end to end (parse + load) in a child process.
+# from_net reads a .net directly, so this needs no BNGPATH, no BNG2.pl and no
+# network: it isolates the compiled core itself.
+_SELFTEST_NET = """\
+# bngsim-benchmarks doctor core self-test network
+begin parameters
+    1 _rateLaw1  1.0
+end parameters
+begin species
+    1 A() 100
+end species
+begin reactions
+    1 1 0 _rateLaw1 #_R1
+end reactions
+"""
+
+
+def _selftest_verdict(returncode: int, stderr: str) -> tuple[bool, list[str]]:
+    """Turn a core self-test child's exit into (passed, lines-to-print).
+
+    returncode 0 means from_net loaded the model. A NEGATIVE returncode means the
+    child died on a signal N (-N): a native crash with no Python traceback -- the
+    failure mode this check exists for. Classically an ABI mismatch: a bngsim core
+    built against one libstdc++ run against another (a pre-GCC-9 build of
+    std::filesystem::path run against a GCC>=9 libstdc++ corrupts the heap inside
+    from_net). A POSITIVE returncode is an ordinary Python exception (e.g. the core
+    rejected the net) -- surfaced verbatim, not as an ABI diagnosis.
+    """
+    if returncode == 0:
+        return True, ["OK   bngsim core loads a model (from_net)"]
+    if returncode < 0:
+        sig = -returncode
+        try:
+            name = signal.Signals(sig).name
+        except ValueError:
+            name = f"signal {sig}"
+        return False, [
+            f"FAIL bngsim core crashed loading a trivial model ({name}) -- almost always a C++",
+            "     libstdc++ ABI mismatch between the compiler that built bngsim's core and this",
+            "     environment's libstdc++ (e.g. a system GCC<9 build of std::filesystem run",
+            "     against a conda-forge GCC>=9 libstdc++). Rebuild bngsim's core with the SAME",
+            "     toolchain that provides your runtime libstdc++; see docs/BUILD_NOTES.md.",
+        ]
+    tail = (stderr.strip().splitlines() or ["(no output)"])[-1][:200]
+    return False, [f"FAIL bngsim core could not load the self-test model: {tail}"]
+
+
+def _check_core_loads_net() -> bool:
+    """Whether bngsim's native core actually LOADS a model here, not just imports.
+
+    doctor's build-commit check confirms only that ``import bngsim`` works. But the
+    compiled core can import cleanly and then segfault on first real use, leaving no
+    traceback and no result -- just ``exit -11`` hours into a timing run on an
+    otherwise-wasted exclusive node. We catch it before that: load a trivial .net in
+    a CHILD process (so a fatal signal cannot take doctor down) with core dumps
+    disabled, and translate the exit into an actionable message.
+    """
+    import tempfile
+
+    def _no_core() -> None:  # pragma: no cover - POSIX child setup
+        import resource
+
+        resource.setrlimit(resource.RLIMIT_CORE, (0, 0))
+
+    code = "import sys, bngsim; bngsim.Model.from_net(sys.argv[1])"
+    with tempfile.TemporaryDirectory() as d:
+        net = Path(d) / "selftest.net"
+        net.write_text(_SELFTEST_NET, encoding="utf-8")
+        try:
+            proc = subprocess.run(
+                [sys.executable, "-c", code, str(net)],
+                capture_output=True, text=True, timeout=120, check=False,
+                preexec_fn=_no_core,
+            )
+        except (OSError, subprocess.SubprocessError) as exc:
+            print(f"FAIL bngsim core: cannot run the load self-test ({type(exc).__name__}: {exc})")
+            return False
+    passed, lines = _selftest_verdict(proc.returncode, proc.stderr)
+    for line in lines:
+        print(line)
+    return passed
+
+
 def _check_roadrunner_loads(env) -> bool:
     """Whether libRoadRunner, the SBML reference ODE engine, imports here.
 
@@ -332,6 +417,11 @@ def cmd_doctor(args) -> int:
     if not b.get("build_commit"):
         ok = False
         print(f"FAIL bngsim: {b.get('error') or 'no build commit'}")
+    else:
+        # The core imported (it stamped a commit); confirm it also LOADS a model.
+        # A core that imports but segfaults in from_net otherwise sails past doctor
+        # and dies only mid-run (see docs/BUILD_NOTES.md, ABI mismatch).
+        ok = _check_core_loads_net() and ok
     if g.get("error"):
         ok = False
         print(f"FAIL BioNetGen: {g['error']} (run `pixi run fetch-bionetgen`)")

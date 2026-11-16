@@ -11,6 +11,22 @@ which PyPI/conda do not fully cover.
 Nothing here changes the x86-64 path. The wheels the suite runs on today are
 untouched; this is additive.
 
+> **The one rule that governs every native build here — ABI consistency.** Build
+> each engine's compiled core with the **same conda-forge toolchain that provides
+> the `libstdc++` it will run against** — never the cluster's system `gcc`/`g++`.
+> A C++ object built against one `libstdc++` and run against another is undefined
+> behaviour, and the usual symptom is a **segfault at runtime, not a link error at
+> build time** — so it passes every build step and then crashes in use. The sharp
+> edge is `std::filesystem::path`, whose internal layout changed at the **GCC 9
+> ABI break**: a core built with a system GCC 8 but run against a conda-forge
+> GCC ≥ 9 `libstdc++` corrupts the heap the first time it handles a path (e.g. a
+> `.net` filename) and crashes with no traceback. The suite's run environments are
+> conda-forge (GCC 13-era `libstdc++`), so **every engine core here is built with
+> the conda-forge compiler**, matching the x86 wheels' own toolchain. `bench
+> doctor` now actively guards this: it loads a trivial model in a child process
+> and reports the ABI mismatch by name if the core crashes, rather than letting a
+> run reach a compute node and die silently.
+
 > **Cluster specifics.** The commands below use placeholders — `<arm-partition>`,
 > `<account>`, `<qos>` — for Slurm identifiers. Fill them from your site's
 > allocation (on Darwin these live in the git-ignored `slurm.yaml` and `dev/`,
@@ -20,7 +36,7 @@ untouched; this is additive.
 
 | Engine | aarch64 availability | Build effort | Needs LLVM? |
 | --- | --- | --- | --- |
-| **BNGsim** (system under test) | PyPI wheel exists; `pixi install` works | none | no |
+| **BNGsim** (system under test) | x86-64 PyPI wheel only; **aarch64 builds from the `v0.17.2` git checkout** | moderate CMake (SUNDIALS vendored) | no |
 | **run_network** (BioNetGen) | no aarch64 prebuilt; **build from 2.9.3 source** | moderate CMake | no |
 | **AMICI** | PyPI **sdist** → `uv pip install amici` compiles it | moderate (SUNDIALS vendored) | no |
 | **COPASI CLI** | plain CMake C++ build if no aarch64 prebuilt | moderate CMake | no |
@@ -68,6 +84,65 @@ Two gotchas that will waste an afternoon if you hit them cold:
 - **`/tmp` is node-local tmpfs and does not persist across allocations.** Put
   scratch builds and caches under `$HOME/.cache` (NFS, shared across
   architectures and allocations) so a second `srun` can still see them.
+
+## BNGsim on aarch64 (from the git checkout, conda-forge toolchain)
+
+PyPI ships only an x86-64 wheel for BNGsim, so on aarch64 the native core is
+built locally. Two non-obvious requirements — miss either and the build
+"succeeds" but the result is unusable:
+
+1. **Build from the `v0.17.2` git checkout, not the PyPI sdist.** BNGsim's CMake
+   bakes the build commit from `git rev-parse` into the compiled core, and that
+   commit gates `bench doctor` READY, gates `bench submit`, and is part of the
+   result freshness key. A PyPI sdist has no `.git`, so an sdist build reports a
+   null commit — which both fails `doctor` and gives the ARM result a different
+   fingerprint than the x86 wheel, defeating the "same build, two platforms"
+   premise of the `docs/DESIGN.md` section 9.1 timing gate. Clone with
+   `--recurse-submodules` at the tag so the commit matches the x86 wheel exactly.
+
+2. **Build with the conda-forge compiler, never the node's system `g++`** (the
+   ABI rule at the top of this file). A `uv pip install <path>` / `pip install
+   <path>` picks up whatever `g++` is first on `PATH`, which on a RHEL 8 ARM node
+   is the system **GCC 8.5** — a `std::filesystem` ABI that predates the GCC 9
+   break. Run against the env's conda-forge `libstdc++` (GCC 13), that core
+   segfaults the first time `Model.from_net` touches the `.net` path, with no
+   traceback. Build inside the **same conda-forge toolchain** as the other
+   engines and the ABI matches.
+
+Pinned toolchain (native aarch64 pixi; mirrors the roadrunner one). The
+`c-compiler`/`cxx-compiler` metapackages install the activation scripts that
+export `$CC`/`$CXX`; `pip` must be present (scikit-build-core drives the build
+through it):
+
+```
+channels = ["conda-forge"], platforms = ["linux-aarch64"]
+python=3.12  pip  numpy  c-compiler  cxx-compiler  gcc=13.*  gxx=13.*
+make  cmake>=3.18  ninja  pkg-config  scikit-build-core>=0.10  pybind11>=2.13
+```
+
+Build a wheel, then install **that wheel** (not a `{ path = <src> }` entry,
+which would rebuild with the wrong compiler at install time):
+
+```bash
+git clone --branch v0.17.2 --recurse-submodules \
+  https://github.com/lanl/bngsim.git <bngsim-src>
+
+# Inside the conda-forge toolchain env, so $CC/$CXX point at the conda gcc 13.
+# The build FetchContents SUNDIALS 7.2.1; pre-download it and name it with an
+# absolute path so the build needs no network (its sha256 is checked against
+# third_party/sundials/VENDOR.json):
+export BNGSIM_SUNDIALS_ARCHIVE=<abs>/sundials-7.2.1.tar.gz
+export BNGSIM_ENABLE_KLU=ON BNGSIM_REQUIRE_KLU=ON
+export CMAKE_ARGS="-DCMAKE_C_COMPILER=$CC -DCMAKE_CXX_COMPILER=$CXX"
+python -m pip wheel <bngsim-src> --no-deps --no-build-isolation -w <wheel-out>
+```
+
+Confirm the result before trusting it:
+
+- `readelf -p .comment _bngsim_core*.so` names the **conda-forge gcc**, not the
+  system GCC 8.
+- `bench doctor` prints `OK bngsim core loads a model (from_net)` (the native
+  load self-test) and the baked `build_commit` matches the x86 wheel's.
 
 ## run_network on aarch64 (BioNetGen 2.9.3 from source)
 
@@ -236,9 +311,12 @@ work without any `LD_LIBRARY_PATH` plumbing:
 
 The run environment itself is an ordinary aarch64 conda/pixi env carrying what
 the ODE capability needs — `python=3.12`, `perl`, `numpy`, `pyyaml`, and
-`python-libsbml` (the SBML reader; it is on conda-forge for aarch64), plus
-`bngsim` from its PyPI sdist (no aarch64 wheel, but the sdist builds). Confirm it
-with `bench doctor`, which imports roadrunner and integrates a model.
+`python-libsbml` (the SBML reader; it is on conda-forge for aarch64), plus the
+locally built **BNGsim wheel** (see "BNGsim on aarch64" above — install the
+prebuilt wheel, **not** a `{ path = <src> }` entry or the PyPI sdist, either of
+which rebuilds the core with the wrong compiler and segfaults). Confirm it with
+`bench doctor`, which now both imports roadrunner and runs the native load
+self-test on BNGsim's core.
 
 ## AMICI / COPASI CLI (future reference engines)
 
