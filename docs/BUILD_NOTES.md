@@ -24,12 +24,15 @@ untouched; this is additive.
 | **run_network** (BioNetGen) | no aarch64 prebuilt; **build from 2.9.3 source** | moderate CMake | no |
 | **AMICI** | PyPI **sdist** → `uv pip install amici` compiles it | moderate (SUNDIALS vendored) | no |
 | **COPASI CLI** | plain CMake C++ build if no aarch64 prebuilt | moderate CMake | no |
-| **libRoadRunner** | **no aarch64 wheel and no sdist on PyPI** | heavy | **yes** — the long pole |
+| **libRoadRunner** | **no aarch64 wheel and no sdist on PyPI**; **built from source (done)** | moderate CMake | yes — satisfied by a prebuilt conda-forge LLVM |
 
-Only libRoadRunner needs LLVM from source: its `libroadrunner-deps` prebuilt
-bundle covers x86-64 Linux, macOS-arm64 and Windows but not linux-aarch64, and
-these nodes have no LLVM module. run_network, AMICI and COPASI CLI are ordinary
-native builds with no LLVM dependency.
+libRoadRunner is the only engine that needs LLVM, but LLVM does **not** have to
+be built from source: conda-forge ships a prebuilt `llvmdev` for linux-aarch64
+at the exact version libRoadRunner wants (13.0.x), and RoadRunner's
+`FindLLVM.cmake` discovers it through `llvm-config`. Installing that prebuilt
+LLVM turns what used to be a multi-hour build into an ordinary ~6-minute CMake
+build. run_network, AMICI and COPASI CLI are ordinary native builds with no LLVM
+dependency.
 
 ## aarch64 cluster tooling
 
@@ -115,15 +118,94 @@ Notes:
   `pixi run fetch-glibc` exists only because the *prebuilt* 2.9.3 binary wants
   glibc ≥ 2.34; see the freshness note in `docs/DESIGN.md` section 6.)
 
-## libRoadRunner on aarch64 (the long pole)
+## libRoadRunner on aarch64 (built from source)
 
 No `linux-aarch64` wheel and no sdist exist on PyPI for 2.11.0, so it is built
-from `sys-bio/roadrunner` at tag `v2.11.0`. The single heavy step is **LLVM from
-source**, because the `libroadrunner-deps` prebuilt dependency bundle skips
-linux-aarch64 and the ARM nodes carry no LLVM module. Everything else is an
-ordinary CMake build. This is the remaining task before the section 9.1 ARM leg
-can include libRoadRunner; it does not block the x86-64 suite, which uses the
-published wheel.
+from `sys-bio/roadrunner` at tag `v2.11.0`. This does not block the x86-64 suite,
+which uses the published wheel.
+
+The one piece that looks heavy — LLVM — does **not** need to be built from
+source. conda-forge publishes a prebuilt `llvmdev` for linux-aarch64 at the
+version RoadRunner wants, and RoadRunner finds it via `llvm-config`. With that,
+the whole thing is two ordinary CMake builds and finishes in minutes, not hours.
+
+### Pins (verified against roadrunner v2.11.0's own CI, `.github/workflows/main.yml`)
+
+- **roadrunner** `v2.11.0`.
+- **libroadrunner-deps** `v2.3.7` — must match the roadrunner tag. RoadRunner
+  checks the SUNDIALS version it finds, so a mismatched deps revision fails the
+  configure (upstream issue #1403). The deps repo vendors everything it needs as
+  git submodules (libSBML 5.21.2, SUNDIALS, POCO, CLAPACK, nleq1/2, rr-libstruct,
+  expat, zlib, bzip2, NuML, libSEDML, SBMLNetwork), so a `--recurse-submodules`
+  clone is self-contained — no per-dependency hunting.
+- **LLVM 13.0.x** — RoadRunner 2.11.0 is an LLVM-13 codebase (MCJIT/OrcJIT). Use
+  conda-forge `llvmdev=13.0.1` for linux-aarch64 (prebuilt, PIC- and
+  RTTI-enabled, so its static archives link into the Python extension). This is
+  the step that would otherwise be an LLVM-from-source compile.
+- **SWIG 4.x** for the Python bindings (the docs say "3.0.0" but that is stale;
+  CI uses 4.x). **C++17.** **No Fortran compiler** anywhere — nleq1/2 and CLAPACK
+  are f2c-translated C, and SuiteSparse/KLU is not part of deps `v2.3.7`.
+
+### Toolchain (one env, for ABI consistency)
+
+Build libroadrunner-deps *and* roadrunner with a single conda-forge aarch64
+toolchain — the same family that built `llvmdev` — so libstdc++ ABI is
+consistent across LLVM, the deps, and the final `.so`. Use the
+**`c-compiler` / `cxx-compiler` metapackages**, not bare `gcc`/`gxx`: only the
+metapackages install the conda activation scripts that export `$CC`/`$CXX`.
+Without them CMake fails immediately with "No CMAKE_C_COMPILER could be found".
+A pinned env (native aarch64 pixi) that works:
+
+```
+channels   = ["conda-forge"], platforms = ["linux-aarch64"]
+python=3.12  c-compiler  cxx-compiler  gcc=13.*  make  cmake>=3.18  ninja
+pkg-config  swig>=4.0.2  llvmdev=13.0.1.*  zlib  ncurses  libxml2  numpy
+```
+
+### Build
+
+```bash
+# 1. deps (self-contained; vendors libSBML/SUNDIALS/POCO/CLAPACK/nleq/... as submodules)
+git clone --branch v2.3.7 --recurse-submodules \
+  https://github.com/sys-bio/libroadrunner-deps.git
+cmake -S libroadrunner-deps -B libroadrunner-deps/build -G Ninja \
+  -DCMAKE_BUILD_TYPE=Release -DCMAKE_INSTALL_PREFIX=<deps-install> \
+  -DCMAKE_POSITION_INDEPENDENT_CODE=ON
+cmake --build libroadrunner-deps/build --target install
+
+# 2. roadrunner against the deps tree + the conda-forge LLVM
+git clone --branch v2.11.0 https://github.com/sys-bio/roadrunner.git
+cmake -S roadrunner -B roadrunner/build -G Ninja \
+  -DCMAKE_BUILD_TYPE=Release -DCMAKE_INSTALL_PREFIX=<rr-install> \
+  -DRR_DEPENDENCIES_INSTALL_PREFIX=<deps-install> \
+  -DLLVM_INSTALL_PREFIX=<conda-env-prefix> \
+  -DCMAKE_POSITION_INDEPENDENT_CODE=ON \
+  -DBUILD_PYTHON=ON -DPython_ROOT_DIR=<conda-env-prefix> \
+  -DSWIG_EXECUTABLE=<conda-env-prefix>/bin/swig \
+  -DBUILD_TESTS=OFF -DBUILD_RR_PLUGINS=OFF -DBUILD_EXAMPLES=OFF
+cmake --build roadrunner/build --target install
+```
+
+The importable package lands at `<rr-install>/site-packages/roadrunner`; add
+that `site-packages` to `PYTHONPATH`.
+
+### Two things that trip up downstream use
+
+- **dist-info.** The CMake install drops the `roadrunner` package but no
+  `*.dist-info`, so `importlib.metadata.version("libroadrunner")` — how the suite
+  reads the engine version — returns nothing. Write a minimal
+  `libroadrunner-<ver>.dist-info/METADATA` (`Name: libroadrunner`,
+  `Version: 2.11.0`) next to the package.
+- **libpython.** The `_roadrunner.so` needs the env's `libpython3.12` at import;
+  the suite already preloads it with `RTLD_GLOBAL` (`src/bench/env.py`). Outside
+  the suite, ensure the conda env's `lib/` is reachable.
+
+### Verified on aarch64 (ThunderX2, 2026-11-16)
+
+`roadrunner.__version__ == 2.11.0`; `getVersionStr` reports
+`JIT Compiler: LLVM-13.0`, `gcc 13.4.0`, `LibSBML Version: 5.21.2`; a first-order
+decay integrates to `100·e⁻¹ = 36.78794` under CVODE. End-to-end build was
+~6 minutes on 48 cores.
 
 ## AMICI / COPASI CLI (future reference engines)
 
