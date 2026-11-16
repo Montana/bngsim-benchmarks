@@ -319,13 +319,14 @@ which rebuilds the core with the wrong compiler and segfaults). Confirm it with
 `bench doctor`, which now both imports roadrunner and runs the native load
 self-test on BNGsim's core.
 
-## COPASI (prepared) and AMICI (next reference engine)
+## COPASI and AMICI (prepared reference engines)
 
 Both are drop-in `REFERENCE_ENGINES` entries per `docs/DESIGN.md` section 5.2.
-The `CopasiODE` adapter, its `pixi.toml` pins, `env.copasi_identity()`, and the
-`bench doctor` import check are all in place; the registry entry (the one-line
-"flip" that re-ids and re-runs the ODE corpus) is held back until the
-cross-platform timing leg finishes, so the two platform legs stay comparable.
+The `CopasiODE` and `AmiciODE` adapters, their `pixi.toml` pins,
+`env.copasi_identity()`/`env.amici_identity()`, and the `bench doctor` checks are
+all in place; the registry entries (the one-line "flip" that re-ids and re-runs
+the ODE corpus) are held back until the cross-platform timing leg finishes, so
+the two platform legs stay comparable.
 
 - **COPASI** needs **no build on any platform**. `python-copasi` (the SWIG
   bindings carrying the native engine) ships cp312 `manylinux_2_28` wheels for
@@ -336,11 +337,43 @@ cross-platform timing leg finishes, so the two platform legs stay comparable.
   a unit compartment, so a species' concentration equals its amount numerically
   (what BNGsim reports), while COPASI's particle *number* is that amount times
   Avogadro.
-- **AMICI** is the next engine to land (its own PR, alongside its `pixi.toml`
-  pins and `bench doctor` self-test). It publishes a PyPI **sdist on every
-  platform** (never a wheel), so `uv pip install amici` compiles the C++/SWIG
-  core locally on x86-64 and aarch64 alike (SUNDIALS is vendored; no LLVM). It
-  also compiles a fresh C++ module per model at runtime via `sbml2amici`, using
-  `$CC`/`$CXX` — so the conda-toolchain ABI discipline that the BNGsim core needs
-  (build against the env's own libstdc++, not the system GCC 8.5) applies to
-  AMICI's compiler too, on both platforms.
+- **AMICI** publishes a PyPI **sdist on every platform** (never a wheel), so
+  `pixi install` compiles the C++/SWIG core locally on x86-64 and aarch64 alike
+  (SUNDIALS is vendored; no LLVM). It also compiles a fresh C++ module per model
+  at runtime via `sbml2amici`, using `$CC`/`$CXX` — so the conda-toolchain ABI
+  discipline that the BNGsim core needs (build against the env's own `libstdc++`,
+  not the system GCC 8.5) applies to AMICI's compiler too, on both platforms.
+  Three things make its `pixi install` reproducible, all encoded in the manifest
+  rather than needing a manual step:
+    - **The build toolchain is pinned as conda dependencies** (`c-compiler`,
+      `cxx-compiler`, `swig`, `cmake`, `ninja`). Pixi activates the conda
+      environment before building an sdist, so these — and the `libstdc++` they
+      target — are what the compile sees, not the node's system packages.
+    - **`CC`/`CXX` are pointed at the conda-forge GCC** via
+      `[target.linux-64.activation.env]` (the fully-qualified
+      `x86_64-conda-linux-gnu-gcc`/`g++`). The env ships no compiler
+      `activate.d` script, so without this the build would fall back to
+      `/usr/bin/gcc` (8.5 on the cluster) — the exact `std::filesystem` ABI trap
+      above. It is linux-64-scoped because the triple is x86_64-specific: macOS
+      uses its ABI-stable clang, and the out-of-tree aarch64 env uses the
+      `aarch64-conda-linux-gnu` triple (see `dev/BUILD_NOTES.md`).
+    - **`AMICI_TRY_ENABLE_HDF5 = "OFF"`** in `[activation.env]` (global, both
+      platforms). AMICI uses HDF5 only to read/write simulation data as files; the
+      suite drives it in-process through numpy and never touches that path. Left
+      to its "ON if available" default, AMICI's CMake half-finds HDF5 — the C
+      headers resolve but the C++ header `H5Cpp.h` does not — and the build fails
+      compiling `hdf5.cpp`. OFF skips an unused native dependency and makes the
+      build self-contained. It must hold both at install time and when each
+      model's `sbml2amici` reconfigures, hence global rather than linux-64-only.
+  - **Version: pinned to `1.1.0`, one below the current `1.2.0`.** 1.2.0 has two
+    open regressions that would corrupt results silently: a reused `Solver` leaks
+    CVODES root-finding state so a warm re-run differs from a fresh one (breaks
+    the reset-and-rerun timing contract), and an output timepoint within rounding
+    of an event time returns NaN with `rdata.status == 0` (a success status on
+    wrong output). `AmiciODE` already hardens against both — a fresh
+    `create_solver()` per run, and an explicit finite-output check even on
+    `status == 0` — but the pin is the real fix; do not bump until both are
+    resolved upstream. If uv has a stale cached build of a previous attempt (it
+    keys the sdist build dir and can hold an old `CMakeCache`), clear
+    `~/.cache/rattler/cache/uv-cache/{sdists,builds}-*` for amici before a clean
+    rebuild.

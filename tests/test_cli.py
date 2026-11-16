@@ -183,3 +183,22 @@ def test_copasi_check_passes_when_it_imports():
     env = types.SimpleNamespace(
         copasi_identity=lambda: {"version": "4.48.311", "basico": "0.92"})
     assert cli._check_copasi_loads(env) is True
+
+
+def test_amici_check_fails_when_the_package_is_absent():
+    # The environment is pinned to install AMICI; a missing package is a broken
+    # environment and must FAIL, not warn -- same contract as the other engines.
+    env = types.SimpleNamespace(
+        amici_identity=lambda: {"version": None, "error": "PackageNotFoundError"})
+    assert cli._check_amici_loads(env) is False
+
+
+@pytest.mark.integration
+def test_amici_check_passes_when_it_compiles_and_runs():
+    # Unlike the other engines' import checks, AMICI's doctor self-test actually
+    # compiles a C++ model and integrates it -- the ABI-risky path, and slow -- so
+    # it is an integration test, gated behind the pinned package being installed.
+    pytest.importorskip("amici")
+    env = types.SimpleNamespace(
+        amici_identity=lambda: {"version": bench_env.amici_identity().get("version")})
+    assert cli._check_amici_loads(env) is True

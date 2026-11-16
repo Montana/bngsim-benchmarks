@@ -5,6 +5,7 @@ command, reading BioNetGen output, and turning engine results into an outcome.""
 from __future__ import annotations
 
 import sys
+import types
 from pathlib import Path
 
 import numpy as np
@@ -349,6 +350,190 @@ def test_copasi_config_reports_amount_output(fake_basico, monkeypatch):
     assert cfg["output"] == "amount"
     assert cfg["version"] == "4.48.311"
     assert "load_seconds" in cfg
+
+
+# --------------------------------------------------------------------------- #
+# AmiciODE (fake amici; the real engine compiles a C++ model, exercised by the
+# doctor self-test and the integration smoke, not here)
+# --------------------------------------------------------------------------- #
+class _FakeSolver:
+    def __init__(self):
+        self.rtol = self.atol = None
+        self.sensi = self.lmm = None
+
+    def set_relative_tolerance(self, x):
+        self.rtol = x
+
+    def set_absolute_tolerance(self, x):
+        self.atol = x
+
+    def set_sensitivity_order(self, s):
+        self.sensi = s
+
+    def set_linear_multistep_method(self, m):
+        self.lmm = m
+
+
+class _FakeModel:
+    def __init__(self, state_ids, x):
+        self._state_ids = state_ids
+        self._x = x
+        self.timepoints = None
+        self.solvers = []
+
+    def set_timepoints(self, ts):
+        self.timepoints = list(ts)
+
+    def get_state_ids(self):
+        return list(self._state_ids)
+
+    def get_state_ids_solver(self):  # must NOT be used for rdata.x columns
+        raise AssertionError("adapter must use get_state_ids(), not get_state_ids_solver()")
+
+    def create_solver(self):
+        s = _FakeSolver()
+        self.solvers.append(s)
+        return s
+
+
+class _FakeRData:
+    def __init__(self, x, status=0):
+        self.x = x
+        self.status = status
+
+
+class _FakeAmici(types.ModuleType):
+    """A fake top-level ``amici`` module plus its ``amici.sim.sundials`` submodule,
+    wired into ``sys.modules`` so the adapter's imports resolve to it. ``rdata.x``
+    columns follow ``get_state_ids()`` in a deliberately non-BNGsim order, so the
+    adapter's reorder-by-id is what aligns the output."""
+
+    def __init__(self, *, state_ids, x, status=0):
+        super().__init__("amici")
+        self._state_ids = state_ids
+        self._x = np.asarray(x, dtype=float)
+        self._status = status
+        self.sbml2amici_calls = []
+        self.run_calls = []
+        self._model = _FakeModel(state_ids, self._x)
+
+        outer = self
+
+        class _Importer:
+            def __init__(self, path):
+                self.path = path
+
+            def sbml2amici(self, name, outdir, **kwargs):
+                outer.sbml2amici_calls.append((name, outdir, kwargs))
+
+        self.SbmlImporter = _Importer
+
+        class _Module:
+            def get_model(self):
+                return outer._model
+
+        self.import_model_module = lambda name, outdir: _Module()
+
+        # The amici.sim.sundials submodule the adapter's run() imports from.
+        sundials = types.ModuleType("amici.sim.sundials")
+        sundials.SensitivityOrder = types.SimpleNamespace(none="none")
+        sundials.LinearMultistepMethod = types.SimpleNamespace(BDF="BDF")
+
+        def _run_simulation(model, solver):
+            outer.run_calls.append((model, solver))
+            return _FakeRData(outer._x, status=outer._status)
+
+        sundials.run_simulation = _run_simulation
+        self._sundials = sundials
+
+
+@pytest.fixture
+def fake_amici(monkeypatch):
+    # state ids B,A (NOT BNGsim order A,B); x columns follow that: col0=B, col1=A.
+    x = np.array([[0.0, 9.0], [1.0, 8.0], [2.0, 7.0]])
+    fake = _FakeAmici(state_ids=["B", "A"], x=x)
+    monkeypatch.setitem(sys.modules, "amici", fake)
+    monkeypatch.setitem(sys.modules, "amici.sim", types.ModuleType("amici.sim"))
+    monkeypatch.setitem(sys.modules, "amici.sim.sundials", fake._sundials)
+    return fake
+
+
+def test_amici_engine_refuses_an_unalignable_species(fake_amici):
+    # A BNGsim species with no SBML id fails before any compile, like roadrunner.
+    with pytest.raises(RuntimeError, match="cannot align"):
+        ode.AmiciODE(Path("m.xml"), ["A()", "B()"], {"A()": "A"},
+                     {"t_start": 0, "t_end": 1, "n_steps": 1, "rtol": 1e-8, "atol": 1e-8})
+
+
+def test_amici_run_selects_state_columns_in_bngsim_order(fake_amici):
+    # BNGsim order A() then B() -> ids A, B. rdata.x columns are [B, A], so the
+    # adapter must return column 1 (A: 9,8,7) first, then column 0 (B: 0,1,2).
+    eng = ode.AmiciODE(Path("m.xml"), ["A()", "B()"], {"A()": "A", "B()": "B"},
+                       {"t_start": 0, "t_end": 10, "n_steps": 2, "rtol": 1e-8, "atol": 1e-8})
+    out = eng.run()
+    assert out.shape == (3, 2)
+    assert list(out[:, 0]) == [9.0, 8.0, 7.0]
+    assert list(out[:, 1]) == [0.0, 1.0, 2.0]
+
+
+def test_amici_compiles_without_sensitivity_code_and_sets_timepoints(fake_amici):
+    ode.AmiciODE(Path("m.xml"), ["A()"], {"A()": "A"},
+                 {"t_start": 0, "t_end": 10, "n_steps": 2, "rtol": 1e-8, "atol": 1e-8})
+    (name, outdir, kwargs) = fake_amici.sbml2amici_calls[0]
+    assert kwargs["generate_sensitivity_code"] is False
+    # n_steps+1 output points, including both ends.
+    assert fake_amici._model.timepoints == [0.0, 5.0, 10.0]
+
+
+def test_amici_run_uses_a_fresh_solver_configured_for_deterministic_bdf(fake_amici):
+    eng = ode.AmiciODE(Path("m.xml"), ["A()"], {"A()": "A"},
+                       {"t_start": 0, "t_end": 1, "n_steps": 1, "rtol": 1e-7, "atol": 1e-9})
+    eng.run()
+    eng.run()
+    # A new solver per run (no carried CVODES state -- the 1.2.0 #3512 hazard).
+    assert len(fake_amici._model.solvers) == 2
+    s = fake_amici._model.solvers[0]
+    assert s.rtol == 1e-7 and s.atol == 1e-9
+    assert s.sensi == "none"
+    assert s.lmm == "BDF"
+
+
+def test_amici_run_rejects_a_nonzero_status(monkeypatch):
+    x = np.array([[1.0, 0.0], [0.5, 0.5]])
+    fake = _FakeAmici(state_ids=["A", "B"], x=x, status=1)
+    monkeypatch.setitem(sys.modules, "amici", fake)
+    monkeypatch.setitem(sys.modules, "amici.sim", types.ModuleType("amici.sim"))
+    monkeypatch.setitem(sys.modules, "amici.sim.sundials", fake._sundials)
+    eng = ode.AmiciODE(Path("m.xml"), ["A()"], {"A()": "A"},
+                       {"t_start": 0, "t_end": 1, "n_steps": 1, "rtol": 1e-8, "atol": 1e-8})
+    with pytest.raises(RuntimeError, match="status 1"):
+        eng.run()
+
+
+def test_amici_run_rejects_nan_with_success_status(monkeypatch):
+    # AMICI issue #3513: status 0 but a NaN row. A silent NaN would slip past the
+    # verdict's nan-skipping metric, so the adapter must reject it.
+    x = np.array([[1.0, 0.0], [np.nan, 0.5]])
+    fake = _FakeAmici(state_ids=["A", "B"], x=x, status=0)
+    monkeypatch.setitem(sys.modules, "amici", fake)
+    monkeypatch.setitem(sys.modules, "amici.sim", types.ModuleType("amici.sim"))
+    monkeypatch.setitem(sys.modules, "amici.sim.sundials", fake._sundials)
+    eng = ode.AmiciODE(Path("m.xml"), ["A()"], {"A()": "A"},
+                       {"t_start": 0, "t_end": 1, "n_steps": 1, "rtol": 1e-8, "atol": 1e-8})
+    with pytest.raises(RuntimeError, match="non-finite"):
+        eng.run()
+
+
+def test_amici_config_reports_cvodes_bdf_amounts(fake_amici, monkeypatch):
+    monkeypatch.setattr(ode.env, "amici_identity", lambda: {"version": "1.1.0"})
+    eng = ode.AmiciODE(Path("m.xml"), ["A()"], {"A()": "A"},
+                       {"t_start": 0, "t_end": 1, "n_steps": 1, "rtol": 1e-8, "atol": 1e-8})
+    cfg = eng.config()
+    assert cfg["integrator"] == "CVODES BDF"
+    assert cfg["output"] == "amount"
+    assert cfg["sensitivities"] == "none"
+    assert cfg["version"] == "1.1.0"
+    assert "load_seconds" in cfg and "codegen_seconds" in cfg
 
 
 @pytest.mark.integration

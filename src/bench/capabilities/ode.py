@@ -10,7 +10,7 @@ reference ODE engine in ``REFERENCE_ENGINES``. Seeded now with:
 
 Further SBML-reading references drop in the same way, with the same
 warm/run/config contract; nothing else changes when one is added. ``CopasiODE``
-below is an adapter ready to join (AMICI is the next): it is defined here but held
+and ``AmiciODE`` below are adapters ready to join: they are defined here but held
 out of ``REFERENCE_ENGINES`` until the cross-platform timing leg finishes, because
 adding one re-ids every ODE job (``engines_id``) and re-runs the corpus.
 
@@ -508,6 +508,114 @@ class CopasiODE:
             "version": env.copasi_identity().get("version"),
             "output": "amount",
             "load_seconds": self.load_seconds,
+        }
+
+
+class AmiciODE:
+    """AMICI as a reference engine, reading SBML exported from the ``.net``.
+
+    AMICI compiles the SBML model to a C++/SWIG Python extension and integrates it
+    with CVODES. The compile is done once in ``__init__`` -- a cold cost, like
+    roadrunner's model load, recorded as ``codegen_seconds`` -- into a directory
+    under the job's node-local scratch (``sbml.parent``), which the worker tears
+    down afterwards. Each run then uses a **fresh solver** (``create_solver`` makes
+    a new one each call), so there is no carried solver state between runs; that
+    sidesteps the reused-solver root-finding leak in AMICI 1.2.0 (issue #3512) and
+    gives the same independent-integration-from-initial-state contract roadrunner's
+    ``reset()`` does.
+
+    Columns are read as **amounts** (``rdata.x``, the model state) and aligned to
+    BNGsim's order by SBML id via the name map, never by position; BNG-derived SBML
+    has a unit compartment, so an amount equals a concentration numerically and is
+    what BNGsim's ``.species`` reports. The pinned version is 1.1.0; see
+    ``pixi.toml`` for why 1.2.0 is held back. The 1.x API is snake_case throughout,
+    with the solver enums living in ``amici.sim.sundials`` (not top-level
+    ``amici``).
+    """
+
+    NAME = "amici"
+    INPUT = "sbml"
+
+    def __init__(self, sbml: Path, species_names: list[str], name_to_id: dict[str, str],
+                 proto: dict[str, Any]):
+        import amici
+
+        missing = [n for n in species_names if n not in name_to_id]
+        if missing:
+            raise RuntimeError(
+                f"cannot align {len(missing)} BNGsim species to SBML ids "
+                f"(e.g. {missing[:3]}); export/name map is wrong")
+        want_ids = [name_to_id[n] for n in species_names]
+        self.proto = proto
+
+        # Compile the model once into the job's node-local scratch. sbml2amici
+        # shells out to $CC/$CXX (the conda compiler, per pixi.toml) to build a
+        # fresh extension; generate_sensitivity_code=False keeps it to the forward
+        # problem, which is all a trajectory comparison needs.
+        outdir = sbml.parent / "amici_model"
+        t0 = time.perf_counter()
+        amici.SbmlImporter(str(sbml)).sbml2amici(
+            "bench_model", str(outdir), generate_sensitivity_code=False, verbose=False)
+        self.codegen_seconds = time.perf_counter() - t0
+
+        t1 = time.perf_counter()
+        self.model = amici.import_model_module("bench_model", str(outdir)).get_model()
+        p = proto
+        self.model.set_timepoints(
+            np.linspace(float(p["t_start"]), float(p["t_end"]), int(p["n_steps"]) + 1))
+        self.load_seconds = time.perf_counter() - t1
+
+        # rdata.x columns follow model.get_state_ids() (the SBML ids), NOT
+        # get_state_ids_solver() (the conservation-law-reduced solver state, a
+        # different length). Map BNGsim's ids onto those columns, guarding on any
+        # that AMICI does not expose.
+        pos = {sid: i for i, sid in enumerate(self.model.get_state_ids())}
+        unmapped = [i for i in want_ids if i not in pos]
+        if unmapped:
+            raise RuntimeError(
+                f"cannot align {len(unmapped)} SBML ids to AMICI state ids "
+                f"(e.g. {unmapped[:3]}); the SBML export and AMICI disagree")
+        self.idx = [pos[i] for i in want_ids]
+
+    def run(self):
+        from amici.sim.sundials import (
+            LinearMultistepMethod, SensitivityOrder, run_simulation)
+
+        p = self.proto
+        # Fresh solver per run: cheap, and it carries no state between runs.
+        solver = self.model.create_solver()
+        solver.set_relative_tolerance(float(p["rtol"]))
+        solver.set_absolute_tolerance(float(p["atol"]))
+        solver.set_sensitivity_order(SensitivityOrder.none)
+        solver.set_linear_multistep_method(LinearMultistepMethod.BDF)
+        rdata = run_simulation(self.model, solver)
+        if rdata.status != 0:
+            raise RuntimeError(f"AMICI simulation failed with status {rdata.status}")
+        x = np.asarray(rdata.x)
+        # A success status does not by itself guarantee finite output (AMICI issue
+        # #3513 returns NaN with status 0); and a silent NaN would slip past the
+        # verdict's nan-skipping error metric, so reject it here.
+        if not np.all(np.isfinite(x)):
+            raise RuntimeError("AMICI returned non-finite values with a success status")
+        return x[:, self.idx]
+
+    # A fresh solver each run already integrates from the initial state, so warm
+    # and cold do the same work (the cost that differs, the compile, is in __init__).
+    warm = run
+
+    @staticmethod
+    def trajectory(values: np.ndarray) -> np.ndarray:
+        # run() already selected the state columns in BNGsim order.
+        return np.asarray(values)
+
+    def config(self) -> dict[str, Any]:
+        return {
+            "integrator": "CVODES BDF",
+            "version": env.amici_identity().get("version"),
+            "sensitivities": "none",
+            "output": "amount",
+            "load_seconds": self.load_seconds,
+            "codegen_seconds": self.codegen_seconds,
         }
 
 

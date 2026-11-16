@@ -410,6 +410,107 @@ def _check_copasi_loads(env) -> bool:
     return True
 
 
+_AMICI_SELFTEST = r'''
+import sys, tempfile, numpy as np
+import amici
+from amici.sim.sundials import run_simulation, SensitivityOrder, LinearMultistepMethod
+
+# A trivial irreversible conversion A -> B, k=1, as SBML. Compiling and running
+# this exercises exactly the runtime path AmiciODE uses: sbml2amici shells out to
+# $CC/$CXX to build a fresh extension, then CVODES integrates it.
+SBML = """<?xml version="1.0" encoding="UTF-8"?>
+<sbml xmlns="http://www.sbml.org/sbml/level3/version2/core" level="3" version="2">
+  <model>
+    <listOfCompartments><compartment id="c" size="1" constant="true"/></listOfCompartments>
+    <listOfSpecies>
+      <species id="A" compartment="c" initialAmount="1" hasOnlySubstanceUnits="true" boundaryCondition="false" constant="false"/>
+      <species id="B" compartment="c" initialAmount="0" hasOnlySubstanceUnits="true" boundaryCondition="false" constant="false"/>
+    </listOfSpecies>
+    <listOfParameters><parameter id="k" value="1" constant="true"/></listOfParameters>
+    <listOfReactions>
+      <reaction id="r" reversible="false">
+        <listOfReactants><speciesReference species="A" stoichiometry="1" constant="true"/></listOfReactants>
+        <listOfProducts><speciesReference species="B" stoichiometry="1" constant="true"/></listOfProducts>
+        <kineticLaw><math xmlns="http://www.w3.org/1998/Math/MathML">
+          <apply><times/><ci>k</ci><ci>A</ci></apply>
+        </math></kineticLaw>
+      </reaction>
+    </listOfReactions>
+  </model>
+</sbml>"""
+
+with tempfile.TemporaryDirectory() as d:
+    xml = d + "/m.xml"
+    open(xml, "w").write(SBML)
+    amici.SbmlImporter(xml).sbml2amici("st", d + "/st", generate_sensitivity_code=False, verbose=False)
+    model = amici.import_model_module("st", d + "/st").get_model()
+    model.set_timepoints(np.linspace(0.0, 1.0, 3))
+    solver = model.create_solver()
+    solver.set_sensitivity_order(SensitivityOrder.none)
+    solver.set_linear_multistep_method(LinearMultistepMethod.BDF)
+    rdata = run_simulation(model, solver)
+    assert rdata.status == 0, f"status {rdata.status}"
+    x = np.asarray(rdata.x)
+    assert x.shape == (3, 2), f"shape {x.shape}"
+    assert np.all(np.isfinite(x)), "non-finite output"
+    # A decays, B grows; a smoke that the integration actually ran.
+    assert x[-1, 0] < x[0, 0] and x[-1, 1] > x[0, 1], "trajectory did not evolve"
+sys.exit(0)
+'''
+
+
+def _check_amici_loads(env) -> bool:
+    """Whether AMICI, the CVODES reference engine, compiles AND runs a model here.
+
+    AMICI ships an sdist only, so it is built from source on install, and every
+    model it runs compiles a fresh C++ extension via ``sbml2amici`` using
+    ``$CC``/``$CXX``. That per-model compile is the ABI-risky step -- a mismatch
+    between the compiler and this env's libstdc++ is what segfaulted bngsim's core
+    on ARM -- so a bare ``import amici`` is not enough: doctor must exercise the
+    compile+run, as ``_check_core_loads_net`` does for bngsim. It runs in a CHILD
+    process (a fatal signal cannot take doctor down) and translates a crash into an
+    actionable ABI message. FAILs (not warns): the environment is pinned to install
+    AMICI, so an absent or broken one is a broken environment.
+    """
+    ident = env.amici_identity()
+    if not ident.get("version"):
+        print(f"FAIL AMICI: {ident.get('error') or 'not installed'} "
+              "(pinned in pixi.toml as `amici`)")
+        return False
+
+    def _no_core() -> None:  # pragma: no cover - POSIX child setup
+        import resource
+
+        resource.setrlimit(resource.RLIMIT_CORE, (0, 0))
+
+    try:
+        proc = subprocess.run(
+            [sys.executable, "-c", _AMICI_SELFTEST],
+            capture_output=True, text=True, timeout=300, check=False,
+            preexec_fn=_no_core,
+        )
+    except (OSError, subprocess.SubprocessError) as exc:
+        print(f"FAIL AMICI {ident['version']}: cannot run the compile self-test "
+              f"({type(exc).__name__}: {exc})")
+        return False
+    if proc.returncode == 0:
+        print(f"OK   AMICI {ident['version']} compiles and runs a model")
+        return True
+    if proc.returncode < 0:
+        sig = -proc.returncode
+        try:
+            name = signal.Signals(sig).name
+        except ValueError:
+            name = f"signal {sig}"
+        print(f"FAIL AMICI {ident['version']} crashed compiling/running a model ({name}) -- almost")
+        print("     always a C++ libstdc++ ABI mismatch between $CC/$CXX and this environment's")
+        print("     libstdc++. Set CC/CXX to the conda-forge compiler; see docs/BUILD_NOTES.md.")
+        return False
+    tail = (proc.stderr.strip().splitlines() or ["(no output)"])[-1][:200]
+    print(f"FAIL AMICI {ident['version']} could not compile/run the self-test model: {tail}")
+    return False
+
+
 def _encoding_is_utf8(enc: str) -> bool:
     """Whether ``enc`` names UTF-8, however it is spelled (``UTF-8``, ``utf8``)."""
     try:
@@ -455,6 +556,7 @@ def cmd_doctor(args) -> int:
         ok = _check_run_network_loads(env) and ok
     ok = _check_roadrunner_loads(env) and ok
     ok = _check_copasi_loads(env) and ok
+    ok = _check_amici_loads(env) and ok
     rec = parity_core_record()
     for name, want in rec["files"].items():
         if sha256_file(VENDOR_JSON.parent / "parity_core" / name) != want:
