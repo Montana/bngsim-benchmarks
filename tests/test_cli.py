@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import datetime as dt
+import signal
 import subprocess
 import types
 
@@ -85,6 +86,54 @@ def test_doctor_load_check_fails_on_the_glibc_version_error(monkeypatch):
     err = "run_network: /lib64/libc.so.6: version `GLIBC_2.34' not found (required by run_network)"
     monkeypatch.setattr(cli.subprocess, "run", _fake_run(err))
     assert cli._check_run_network_loads(_doctor_env()) is False
+
+
+def test_core_selftest_verdict_passes_on_clean_exit():
+    passed, lines = cli._selftest_verdict(0, "")
+    assert passed is True
+    assert any("from_net" in s for s in lines)
+
+
+def test_core_selftest_verdict_names_the_abi_mismatch_on_a_segfault():
+    # A native crash leaves no traceback; the child exits -SIGSEGV. The verdict
+    # must FAIL and point at the libstdc++ ABI mismatch and BUILD_NOTES, since that
+    # is overwhelmingly the cause and a bare "exit -11" tells a cluster user nothing.
+    passed, lines = cli._selftest_verdict(-signal.SIGSEGV, "")
+    assert passed is False
+    blob = "\n".join(lines)
+    assert "SIGSEGV" in blob
+    assert "ABI" in blob and "libstdc++" in blob
+    assert "BUILD_NOTES.md" in blob
+
+
+def test_core_selftest_verdict_reports_a_signal_with_no_name():
+    passed, lines = cli._selftest_verdict(-99, "")
+    assert passed is False
+    assert "signal 99" in "\n".join(lines)
+
+
+def test_core_selftest_verdict_surfaces_a_python_error_verbatim():
+    # A POSITIVE exit is an ordinary exception (the core rejected the net), not an
+    # ABI crash -- show the message, do not mis-diagnose it as an ABI mismatch.
+    passed, lines = cli._selftest_verdict(1, "Traceback ...\nModelError: bad .net")
+    assert passed is False
+    blob = "\n".join(lines)
+    assert "ModelError: bad .net" in blob
+    assert "ABI" not in blob
+
+
+def test_core_selftest_check_fails_on_a_segfaulting_child(monkeypatch):
+    def run(cmd, **kw):
+        return subprocess.CompletedProcess(cmd, -signal.SIGSEGV, stdout="", stderr="")
+    monkeypatch.setattr(cli.subprocess, "run", run)
+    assert cli._check_core_loads_net() is False
+
+
+def test_core_selftest_check_passes_when_the_child_loads_the_model(monkeypatch):
+    def run(cmd, **kw):
+        return subprocess.CompletedProcess(cmd, 0, stdout="", stderr="")
+    monkeypatch.setattr(cli.subprocess, "run", run)
+    assert cli._check_core_loads_net() is True
 
 
 @pytest.mark.parametrize("enc", ["utf-8", "UTF-8", "utf8", "UTF8"])
