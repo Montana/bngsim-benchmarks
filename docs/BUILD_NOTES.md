@@ -207,6 +207,39 @@ that `site-packages` to `PYTHONPATH`.
 decay integrates to `100·e⁻¹ = 36.78794` under CVODE. End-to-end build was
 ~6 minutes on 48 cores.
 
+### Wiring the source build into the suite (`$BENCH_ROADRUNNER_PATH`)
+
+The tracked environment pins `libroadrunner` as a wheel, which does not exist
+for linux-aarch64, so on ARM the suite is pointed at the source build instead of
+the (absent) wheel. Set **`BENCH_ROADRUNNER_PATH`** to the build's
+`site-packages` directory — the one holding the `roadrunner` package and the
+synthesized `libroadrunner-<ver>.dist-info`:
+
+```sh
+export BENCH_ROADRUNNER_PATH=<rr-install>/site-packages
+```
+
+The suite prepends it to `sys.path` in-process (`src/bench/env.py`), so it does
+**not** go through `$PYTHONPATH` — on ARM that variable must stay empty (x86
+user-site numpy leaks onto the ARM interpreter through it; see the tooling
+gotchas above). `importlib.metadata.version("libroadrunner")` then resolves from
+the synthesized dist-info, and `env.roadrunner_identity()` records a `source`
+field so an ARM result is never confused with a wheel one. Two things make this
+work without any `LD_LIBRARY_PATH` plumbing:
+
+- The built `_roadrunner.so` carries an **absolute RPATH** into the build
+  toolchain's `lib/`, so `libLLVM-13.so`, `libstdc++.so.6`, and
+  `libpython3.12.so.1.0` all resolve from there automatically.
+- Its `NEEDED libpython3.12.so.1.0` is satisfied by the run env's own
+  Python 3.12 (the suite preloads libpython with `RTLD_GLOBAL`), so the run env
+  and the build env share a Python minor version.
+
+The run environment itself is an ordinary aarch64 conda/pixi env carrying what
+the ODE capability needs — `python=3.12`, `perl`, `numpy`, `pyyaml`, and
+`python-libsbml` (the SBML reader; it is on conda-forge for aarch64), plus
+`bngsim` from its PyPI sdist (no aarch64 wheel, but the sdist builds). Confirm it
+with `bench doctor`, which imports roadrunner and integrates a model.
+
 ## AMICI / COPASI CLI (future reference engines)
 
 Neither is wired into the suite yet (they are drop-in `REFERENCE_ENGINES`

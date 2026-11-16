@@ -81,6 +81,47 @@ def bngsim_identity() -> dict[str, Any]:
     return ident
 
 
+def roadrunner_source_path() -> Path | None:
+    """A source-built libRoadRunner to use instead of an installed wheel, or ``None``.
+
+    ``$BENCH_ROADRUNNER_PATH`` names the ``site-packages`` directory of a
+    from-source build (the ``roadrunner`` package plus its synthesized
+    ``libroadrunner-*.dist-info``). On a platform PyPI covers (linux-64,
+    osx-arm64) the wheel is pinned in ``pixi.toml`` and this is unset; on
+    linux-aarch64, where there is no wheel or sdist, the suite is pointed at a
+    build (see ``docs/BUILD_NOTES.md``). This mirrors how ``BNGPATH`` names the
+    external run_network build and ``BENCH_GLIBC_ROOT`` the loader tree: the
+    tracked environment stays portable, and the one unprovided artifact is
+    located by an env var. ``None`` when the var is unset or names nothing
+    importable.
+    """
+    value = os.environ.get("BENCH_ROADRUNNER_PATH")
+    if not value:
+        return None
+    root = Path(value)
+    return root if (root / "roadrunner").is_dir() else None
+
+
+def _ensure_roadrunner_on_path() -> None:
+    """Put the ``$BENCH_ROADRUNNER_PATH`` build at the front of ``sys.path``.
+
+    Idempotent, and in-process only: it edits this interpreter's ``sys.path``,
+    never the environment the run_network subprocess inherits. Using ``sys.path``
+    rather than ``$PYTHONPATH`` is deliberate -- on the ARM fleet the build notes
+    require ``$PYTHONPATH`` to stay empty (x86 user-site numpy leaks onto the ARM
+    interpreter through it), so the injection cannot ride on that variable.
+    Prepended, not appended, so the build wins over any same-named package.
+    """
+    root = roadrunner_source_path()
+    if root is None:
+        return
+    import sys
+
+    s = str(root)
+    if s not in sys.path:
+        sys.path.insert(0, s)
+
+
 @lru_cache(maxsize=1)
 def roadrunner_identity() -> dict[str, Any]:
     """Version of the installed libRoadRunner, a reference ODE engine.
@@ -88,13 +129,20 @@ def roadrunner_identity() -> dict[str, Any]:
     The version is read from package metadata, so it does not pay the import.
     ``{version: None, error}`` when the package is absent -- the environment is
     pinned to install it, so that is a broken environment, reported as such.
+    ``source`` is recorded when a ``$BENCH_ROADRUNNER_PATH`` build supplies it, so
+    a result from a source build is never mistaken for one from the wheel.
     """
+    _ensure_roadrunner_on_path()
+    source = roadrunner_source_path()
     try:
         from importlib.metadata import version
 
-        return {"version": version("libroadrunner")}
+        ident: dict[str, Any] = {"version": version("libroadrunner")}
     except Exception as exc:  # noqa: BLE001 - any failure means "absent/unreadable"
-        return {"version": None, "error": f"{type(exc).__name__}: {exc}"}
+        ident = {"version": None, "error": f"{type(exc).__name__}: {exc}"}
+    if source is not None:
+        ident["source"] = str(source)
+    return ident
 
 
 def _preload_libpython() -> None:
@@ -134,9 +182,11 @@ def _preload_libpython() -> None:
 def import_roadrunner():
     """Import and return the ``roadrunner`` module, preloading libpython first.
 
-    The single entry point every caller uses, so the libpython workaround lives
-    in one place. See :func:`_preload_libpython`.
+    The single entry point every caller uses, so the libpython workaround and
+    the ``$BENCH_ROADRUNNER_PATH`` injection both live in one place. See
+    :func:`_preload_libpython` and :func:`_ensure_roadrunner_on_path`.
     """
+    _ensure_roadrunner_on_path()
     _preload_libpython()
     import roadrunner
 
