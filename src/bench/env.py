@@ -165,6 +165,24 @@ def copasi_identity() -> dict[str, Any]:
     return ident
 
 
+@lru_cache(maxsize=1)
+def amici_identity() -> dict[str, Any]:
+    """Version of the installed AMICI, a reference ODE engine (CVODES).
+
+    Read from package metadata without paying the import (which pulls in the
+    compiled SWIG core). ``{version: None, error}`` when absent -- the environment
+    is pinned to install it, so that is a broken environment, reported as such.
+    The pin is 1.1.0, held below the latest 1.2.0 on purpose (see ``pixi.toml``).
+    """
+    try:
+        from importlib.metadata import version
+
+        ident: dict[str, Any] = {"version": version("amici")}
+    except Exception as exc:  # noqa: BLE001 - any failure means "absent/unreadable"
+        ident = {"version": None, "error": f"{type(exc).__name__}: {exc}"}
+    return ident
+
+
 def _preload_libpython() -> None:
     """Make this interpreter's ``libpython`` findable by extensions that need it.
 
@@ -394,6 +412,7 @@ def environment() -> dict[str, Any]:
         "bionetgen": bionetgen_identity(),
         "roadrunner": roadrunner_identity(),
         "copasi": copasi_identity(),
+        "amici": amici_identity(),
         "loader": glibc_identity(),
         "harness": harness_identity(),
         "host": host_identity(),

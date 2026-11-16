@@ -121,3 +121,31 @@ def test_copasi_identity_reports_absence_as_an_error(monkeypatch):
         env.copasi_identity.cache_clear()
     assert ident["version"] is None
     assert "PackageNotFoundError" in ident["error"]
+
+
+def test_amici_identity_reports_the_version(monkeypatch):
+    import importlib.metadata as md
+
+    monkeypatch.setattr(md, "version", lambda name: "1.1.0" if name == "amici" else None)
+    env.amici_identity.cache_clear()
+    try:
+        ident = env.amici_identity()
+    finally:
+        env.amici_identity.cache_clear()
+    assert ident == {"version": "1.1.0"}
+
+
+def test_amici_identity_reports_absence_as_an_error(monkeypatch):
+    import importlib.metadata as md
+
+    def _absent(name):
+        raise md.PackageNotFoundError(name)
+
+    monkeypatch.setattr(md, "version", _absent)
+    env.amici_identity.cache_clear()
+    try:
+        ident = env.amici_identity()
+    finally:
+        env.amici_identity.cache_clear()
+    assert ident["version"] is None
+    assert "PackageNotFoundError" in ident["error"]

@@ -31,6 +31,18 @@ perl = "*"
 numpy = ">=2.0"
 pyyaml = "*"
 pytest = "*"
+# AMICI's toolchain. AMICI ships an sdist only (never a wheel), so installing it
+# compiles its C++/SWIG core, and every model it runs compiles a fresh C++ module
+# via `sbml2amici` using $CC/$CXX. Both must build against this env's own
+# libstdc++, not the node's system GCC 8.5: a std::filesystem ABI mismatch against
+# the conda-forge libstdc++ is exactly what segfaulted the bngsim core on ARM (see
+# docs/BUILD_NOTES.md). conda-forge's c-/cxx-compiler metapackages pin a GCC whose
+# libstdc++ matches the env's, so the compiled extensions are ABI-correct.
+c-compiler = "*"
+cxx-compiler = "*"
+swig = ">=4.1"
+cmake = "*"
+ninja = "*"
 
 [pypi-dependencies]
 # The build under test. Every result records the version and compiled build
@@ -57,6 +69,19 @@ libroadrunner = "==2.11.0"
 # cross-platform timing leg (docs/DESIGN.md section 9.1).
 copasi-basico = "==0.92"
 python-copasi = "==4.48.311"
+# AMICI, a fourth reference ODE engine (CVODES BDF), reading the same exported
+# SBML. PyPI ships an sdist only -- no wheels, ever -- so this compiles AMICI's
+# C++/SWIG core from source on install (SUNDIALS is vendored; no LLVM), and every
+# model it runs compiles a fresh C++ module via `sbml2amici`. Both use $CC/$CXX
+# (set to the conda-forge compiler, see [target.linux-64.activation.env]) so the
+# extensions are ABI-matched to this env's libstdc++. PINNED TO 1.1.0, one below
+# latest: 1.2.0 has open regressions -- a reused solver leaks CVODES root-finding
+# state so a warm re-run differs from a fresh one (breaks the reset-and-rerun
+# timing contract), and a timepoint near an event can return NaN with status==0
+# (silent wrong results). Do NOT bump to 1.2.0 until both are fixed upstream.
+# Not yet in REFERENCE_ENGINES: adding it re-ids the ODE corpus, deferred past the
+# section 9.1 cross-platform timing leg (docs/DESIGN.md section 9.1).
+amici = "==1.1.0"
 bngsim-benchmarks = { path = ".", editable = true }
 
 [activation.env]
@@ -69,6 +94,36 @@ BNGPATH = "$PIXI_PROJECT_ROOT/.cache/bionetgen/BioNetGen-2.9.3"
 # corpus BNGL files have one). This covers BNGsim's own reads too, not just the
 # harness's. It is not part of a result's freshness key.
 PYTHONUTF8 = "1"
+# Build AMICI without HDF5. AMICI uses HDF5 only to read/write simulation data as
+# files; the suite drives it in-process through numpy and never touches that path.
+# Left to its default (ON "if available"), AMICI's CMake half-finds HDF5 -- the C
+# headers resolve but the C++ header H5Cpp.h does not -- and the build fails
+# compiling hdf5.cpp. OFF both skips an unused native dependency and makes the
+# build self-contained. Set globally (not linux-64-only) because it must hold at
+# install time AND when each model's `sbml2amici` compiles, on every platform.
+AMICI_TRY_ENABLE_HDF5 = "OFF"
+# Compile AMICI in parallel. Unset, AMICI pins CMAKE_BUILD_PARALLEL_LEVEL=1 --
+# serial -- for both its sdist install build and every per-model `sbml2amici`
+# compile, which on a 2-core CI runner risks the job timeout. Empty means "use all
+# hardware threads". This is timing-safe: a model's compile happens in the
+# adapter's __init__ (recorded as codegen_seconds), never inside the timed
+# run()/warm(), so parallelism here cannot affect a measured trajectory time.
+AMICI_PARALLEL_COMPILE = ""
+
+# Point AMICI's compiler at the env's conda-forge GCC, not the node's system gcc.
+# linux-64 only, because the compiler triple is x86_64-specific and this is the
+# platform with the ABI trap: pixi does not run conda's compiler-activation
+# scripts, so CC/CXX are otherwise unset and AMICI's sdist build and its per-model
+# `sbml2amici` compiles fall back to /usr/bin/gcc (8.5 on Darwin) -- whose
+# libstdc++ ABI does not match the env's, the std::filesystem mismatch that
+# segfaulted the bngsim core on ARM. The conda-forge compiler metapackage installs
+# these fully-qualified binaries; they resolve libstdc++ from this env.
+# $PIXI_PROJECT_ROOT keeps the path portable. (On osx-arm64 AMICI builds with the
+# platform's own clang, which is ABI-stable, so no override is needed there; on the
+# out-of-tree aarch64 env the triple is aarch64-conda-linux-gnu -- see dev notes.)
+[target.linux-64.activation.env]
+CC = "$PIXI_PROJECT_ROOT/.pixi/envs/default/bin/x86_64-conda-linux-gnu-gcc"
+CXX = "$PIXI_PROJECT_ROOT/.pixi/envs/default/bin/x86_64-conda-linux-gnu-g++"
 
 [tasks]
 fetch-bionetgen = { cmd = "bench fetch-bionetgen", description = "Download BioNetGen 2.9.3 and check its sha256" }
