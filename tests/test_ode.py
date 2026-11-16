@@ -4,6 +4,7 @@ command, reading BioNetGen output, and turning engine results into an outcome.""
 
 from __future__ import annotations
 
+import sys
 from pathlib import Path
 
 import numpy as np
@@ -261,6 +262,93 @@ def test_roadrunner_engine_refuses_an_unalignable_species():
     with pytest.raises(RuntimeError, match="cannot align"):
         ode.RoadRunnerODE(Path("unused.xml"), ["A()", "B()"], {"A()": "A"},
                           {"t_start": 0, "t_end": 1, "n_steps": 1, "rtol": 1e-8, "atol": 1e-8})
+
+
+def test_copasi_engine_refuses_an_unalignable_species():
+    # Same alignment guard as roadrunner: no basico import happens before it.
+    with pytest.raises(RuntimeError, match="cannot align"):
+        ode.CopasiODE(Path("unused.xml"), ["A()", "B()"], {"A()": "A"},
+                      {"t_start": 0, "t_end": 1, "n_steps": 1, "rtol": 1e-8, "atol": 1e-8})
+
+
+class _FakeBasico:
+    """Stands in for the ``basico`` module: records the run_time_course call and
+    returns a DataFrame whose columns are SBML ids in an arbitrary order, so the
+    adapter's reorder-by-id is what makes the output BNGsim-ordered."""
+
+    def __init__(self):
+        self.load_calls = []
+        self.run_calls = []
+
+    def load_model(self, path):
+        self.load_calls.append(path)
+        return f"datamodel:{path}"
+
+    def run_time_course(self, *args, **kwargs):
+        import pandas as pd
+
+        self.run_calls.append((args, kwargs))
+        # Columns deliberately NOT in BNGsim order (B before A); the adapter must
+        # reindex to its `selections`.
+        df = pd.DataFrame({"idB": [0.0, 1.0, 2.0], "idA": [9.0, 8.0, 7.0]})
+        df.index.name = "Time"
+        return df
+
+
+@pytest.fixture
+def fake_basico(monkeypatch):
+    fake = _FakeBasico()
+    monkeypatch.setitem(sys.modules, "basico", fake)
+    return fake
+
+
+def test_copasi_run_selects_amount_columns_in_bngsim_order(fake_basico):
+    # Species A() then B(); their SBML ids are idA, idB. The engine must return the
+    # idA column first (BNGsim order), not the DataFrame's native order.
+    eng = ode.CopasiODE(Path("m.xml"), ["A()", "B()"], {"A()": "idA", "B()": "idB"},
+                        {"t_start": 0, "t_end": 10, "n_steps": 2, "rtol": 1e-8, "atol": 1e-8})
+    out = eng.run()
+    assert out.shape == (3, 2)
+    # Column 0 is idA (9,8,7), column 1 is idB (0,1,2) -- reordered to BNGsim order.
+    assert list(out[:, 0]) == [9.0, 8.0, 7.0]
+    assert list(out[:, 1]) == [0.0, 1.0, 2.0]
+
+
+def test_copasi_run_asks_for_concentrations_not_particle_numbers(fake_basico):
+    # The correctness-critical choice: concentration matches a unit-compartment
+    # BNG SBML; use_numbers would be off by Avogadro. Also deterministic LSODA, the
+    # fixed interval count, SBML-id columns, and duration = t_end - t_start.
+    eng = ode.CopasiODE(Path("m.xml"), ["A()"], {"A()": "idA"},
+                        {"t_start": 2, "t_end": 12, "n_steps": 5, "rtol": 1e-7, "atol": 1e-9})
+    eng.run()
+    (args, kwargs) = fake_basico.run_calls[0]
+    assert args == (2.0, 10.0, 5)  # (start, duration, intervals); duration = 12 - 2
+    assert kwargs["method"] == "deterministic"
+    assert kwargs["use_concentrations"] is True
+    assert "use_numbers" not in kwargs
+    assert kwargs["use_sbml_id"] is True
+    assert kwargs["automatic"] is False
+    assert kwargs["r_tol"] == 1e-7 and kwargs["a_tol"] == 1e-9
+
+
+def test_copasi_warm_is_a_fresh_run(fake_basico):
+    # BASICO resets to initial state each call, so warm == run (no reset step of
+    # our own); both issue a run_time_course.
+    eng = ode.CopasiODE(Path("m.xml"), ["A()"], {"A()": "idA"},
+                        {"t_start": 0, "t_end": 1, "n_steps": 1, "rtol": 1e-8, "atol": 1e-8})
+    eng.warm()
+    eng.warm()
+    assert len(fake_basico.run_calls) == 2
+
+
+def test_copasi_config_reports_amount_output(fake_basico, monkeypatch):
+    monkeypatch.setattr(ode.env, "copasi_identity", lambda: {"version": "4.48.311"})
+    eng = ode.CopasiODE(Path("m.xml"), ["A()"], {"A()": "idA"},
+                        {"t_start": 0, "t_end": 1, "n_steps": 1, "rtol": 1e-8, "atol": 1e-8})
+    cfg = eng.config()
+    assert cfg["output"] == "amount"
+    assert cfg["version"] == "4.48.311"
+    assert "load_seconds" in cfg
 
 
 @pytest.mark.integration

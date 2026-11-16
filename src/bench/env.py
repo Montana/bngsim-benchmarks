@@ -145,6 +145,26 @@ def roadrunner_identity() -> dict[str, Any]:
     return ident
 
 
+@lru_cache(maxsize=1)
+def copasi_identity() -> dict[str, Any]:
+    """Versions of COPASI, a reference ODE engine driven through BASICO.
+
+    ``version`` is COPASI itself (the ``python-copasi`` SWIG package that carries
+    the native engine); ``basico`` is the pure-Python wrapper the adapter calls.
+    Both read from package metadata without paying an import. ``{version: None,
+    error}`` when absent -- the environment is pinned to install it, so that is a
+    broken environment, reported as such.
+    """
+    try:
+        from importlib.metadata import version
+
+        ident: dict[str, Any] = {"version": version("python-copasi"),
+                                 "basico": version("copasi-basico")}
+    except Exception as exc:  # noqa: BLE001 - any failure means "absent/unreadable"
+        ident = {"version": None, "error": f"{type(exc).__name__}: {exc}"}
+    return ident
+
+
 def _preload_libpython() -> None:
     """Make this interpreter's ``libpython`` findable by extensions that need it.
 
@@ -373,6 +393,7 @@ def environment() -> dict[str, Any]:
         "bngsim": bngsim_identity(),
         "bionetgen": bionetgen_identity(),
         "roadrunner": roadrunner_identity(),
+        "copasi": copasi_identity(),
         "loader": glibc_identity(),
         "harness": harness_identity(),
         "host": host_identity(),

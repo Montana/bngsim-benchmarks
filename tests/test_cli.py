@@ -166,3 +166,20 @@ def test_roadrunner_check_passes_when_it_imports():
         roadrunner_identity=lambda: {"version": "2.11.0"},
         import_roadrunner=bench_env.import_roadrunner)
     assert cli._check_roadrunner_loads(env) is True
+
+
+def test_copasi_check_fails_when_the_package_is_absent():
+    # The environment is pinned to install COPASI; a missing package is a broken
+    # environment and must FAIL, not warn -- same contract as roadrunner.
+    env = types.SimpleNamespace(
+        copasi_identity=lambda: {"version": None, "error": "PackageNotFoundError"})
+    assert cli._check_copasi_loads(env) is False
+
+
+def test_copasi_check_passes_when_it_imports():
+    # basico carries the native python-copasi extension; skip if the wheel is not
+    # installed on this host rather than fail the suite.
+    pytest.importorskip("basico")
+    env = types.SimpleNamespace(
+        copasi_identity=lambda: {"version": "4.48.311", "basico": "0.92"})
+    assert cli._check_copasi_loads(env) is True

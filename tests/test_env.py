@@ -88,3 +88,36 @@ def test_identity_omits_source_when_unset(monkeypatch):
     finally:
         env.roadrunner_identity.cache_clear()
     assert "source" not in ident
+
+
+def test_copasi_identity_reports_both_versions(monkeypatch):
+    # COPASI's version string is the python-copasi package (the native engine);
+    # basico is the pure-Python wrapper the adapter calls. Both from metadata.
+    import importlib.metadata as md
+
+    versions = {"python-copasi": "4.48.311", "copasi-basico": "0.92"}
+    monkeypatch.setattr(md, "version", lambda name: versions[name])
+    env.copasi_identity.cache_clear()
+    try:
+        ident = env.copasi_identity()
+    finally:
+        env.copasi_identity.cache_clear()
+    assert ident == {"version": "4.48.311", "basico": "0.92"}
+
+
+def test_copasi_identity_reports_absence_as_an_error(monkeypatch):
+    # A missing package is a broken environment (it is pinned); identity records
+    # version=None plus the error, which the doctor turns into a FAIL.
+    import importlib.metadata as md
+
+    def _absent(name):
+        raise md.PackageNotFoundError(name)
+
+    monkeypatch.setattr(md, "version", _absent)
+    env.copasi_identity.cache_clear()
+    try:
+        ident = env.copasi_identity()
+    finally:
+        env.copasi_identity.cache_clear()
+    assert ident["version"] is None
+    assert "PackageNotFoundError" in ident["error"]
