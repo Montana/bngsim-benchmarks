@@ -8,9 +8,11 @@ reference ODE engine in ``REFERENCE_ENGINES``. Seeded now with:
 - **roadrunner** -- libRoadRunner's CVODE, an in-process library that reads SBML
   exported from the same ``.net``, so its verdict also validates the export.
 
-AMICI and COPASI are designed to drop in as further ``REFERENCE_ENGINES`` entries
-(both SBML, both the same warm/run/config contract); nothing else changes when
-one is added.
+Further SBML-reading references drop in the same way, with the same
+warm/run/config contract; nothing else changes when one is added. ``CopasiODE``
+below is an adapter ready to join (AMICI is the next): it is defined here but held
+out of ``REFERENCE_ENGINES`` until the cross-platform timing leg finishes, because
+adding one re-ids every ODE job (``engines_id``) and re-runs the corpus.
 
 Pipeline, per problem:
 
@@ -427,6 +429,83 @@ class RoadRunnerODE:
         return {
             "integrator": "cvode",
             "version": env.roadrunner_identity().get("version"),
+            "output": "amount",
+            "load_seconds": self.load_seconds,
+        }
+
+
+class CopasiODE:
+    """COPASI as a reference engine, reading SBML exported from the ``.net``.
+
+    Driven through BASICO (``copasi-basico``, imported as ``basico``), a
+    pure-Python wrapper over COPASI's SWIG bindings. Like roadrunner it is an
+    in-process library timed warm: the model is loaded once (its cost a separate
+    cold measurement) and each run is one ``run_time_course`` call, which with
+    BASICO's default ``use_initial_values=True`` resets to initial conditions
+    first -- the same reset-and-rerun contract as roadrunner (verified: repeated
+    runs reproduce to the bit).
+
+    Output is read as **concentration**, not particle number. BNG-derived SBML has
+    a unit compartment, so a species' concentration equals its amount numerically,
+    which is what BNGsim's ``.species`` reports; COPASI's particle *number* is that
+    amount times Avogadro, so ``use_numbers`` would be off by ~6e23. Columns are
+    keyed by SBML id (``use_sbml_id=True``) and reordered to BNGsim's column order
+    by the name map, never by position.
+    """
+
+    NAME = "copasi"
+    INPUT = "sbml"
+
+    def __init__(self, sbml: Path, species_names: list[str], name_to_id: dict[str, str],
+                 proto: dict[str, Any]):
+        import basico
+
+        missing = [n for n in species_names if n not in name_to_id]
+        if missing:
+            raise RuntimeError(
+                f"cannot align {len(missing)} BNGsim species to SBML ids "
+                f"(e.g. {missing[:3]}); export/name map is wrong")
+        self.selections = [name_to_id[n] for n in species_names]
+        self.proto = proto
+        t0 = time.perf_counter()
+        # Keep the data-model handle and pass it to every call: BASICO otherwise
+        # operates on a single global "current model", which concurrent engines
+        # in one process would race on. (The suite times serially, but this keeps
+        # the adapter correct regardless.)
+        self.dm = basico.load_model(str(sbml))
+        self.load_seconds = time.perf_counter() - t0
+
+    def run(self):
+        import basico
+
+        p = self.proto
+        t_start, t_end, n_steps = float(p["t_start"]), float(p["t_end"]), int(p["n_steps"])
+        # 3-arg form is (start, duration, intervals); the middle arg is a duration,
+        # not an end time, so pass t_end - t_start.
+        df = basico.run_time_course(
+            t_start, t_end - t_start, n_steps,
+            method="deterministic",  # COPASI's LSODA
+            r_tol=float(p["rtol"]), a_tol=float(p["atol"]),
+            automatic=False,  # honour the fixed interval count, not adaptive output
+            use_concentrations=True,  # amounts for a unit compartment; NOT use_numbers
+            use_sbml_id=True,  # columns keyed by SBML id, for alignment by name map
+            model=self.dm,
+        )
+        return df[self.selections].to_numpy()
+
+    # BASICO resets to initial conditions each call (use_initial_values defaults
+    # True); there is no cheaper warm path to distinguish.
+    warm = run
+
+    @staticmethod
+    def trajectory(values: np.ndarray) -> np.ndarray:
+        # run() already selected the species columns in BNGsim order.
+        return np.asarray(values)
+
+    def config(self) -> dict[str, Any]:
+        return {
+            "method": "deterministic (LSODA)",
+            "version": env.copasi_identity().get("version"),
             "output": "amount",
             "load_seconds": self.load_seconds,
         }

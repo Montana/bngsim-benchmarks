@@ -38,8 +38,8 @@ untouched; this is additive.
 | --- | --- | --- | --- |
 | **BNGsim** (system under test) | x86-64 PyPI wheel only; **aarch64 builds from the `v0.17.2` git checkout** | moderate CMake (SUNDIALS vendored) | no |
 | **run_network** (BioNetGen) | no aarch64 prebuilt; **build from 2.9.3 source** | moderate CMake | no |
-| **AMICI** | PyPI **sdist** → `uv pip install amici` compiles it | moderate (SUNDIALS vendored) | no |
-| **COPASI CLI** | plain CMake C++ build if no aarch64 prebuilt | moderate CMake | no |
+| **AMICI** | PyPI **sdist** on every platform → `uv pip install amici` compiles it (x86-64 and aarch64 alike) | moderate (SUNDIALS vendored); needs a C/C++ toolchain | no |
+| **COPASI** (via BASICO) | **prebuilt `manylinux_2_28` wheels on x86-64 _and_ aarch64** (`python-copasi`); `copasi-basico` is pure Python | none — no build on any platform | no |
 | **libRoadRunner** | **no aarch64 wheel and no sdist on PyPI**; **built from source (done)** | moderate CMake | yes — satisfied by a prebuilt conda-forge LLVM |
 
 libRoadRunner is the only engine that needs LLVM, but LLVM does **not** have to
@@ -47,8 +47,9 @@ be built from source: conda-forge ships a prebuilt `llvmdev` for linux-aarch64
 at the exact version libRoadRunner wants (13.0.x), and RoadRunner's
 `FindLLVM.cmake` discovers it through `llvm-config`. Installing that prebuilt
 LLVM turns what used to be a multi-hour build into an ordinary ~6-minute CMake
-build. run_network, AMICI and COPASI CLI are ordinary native builds with no LLVM
-dependency.
+build. run_network builds from source with no LLVM dependency; AMICI compiles
+from its sdist (no LLVM) on both platforms; COPASI needs no build at all — its
+aarch64 wheel installs like any other.
 
 ## aarch64 cluster tooling
 
@@ -318,12 +319,28 @@ which rebuilds the core with the wrong compiler and segfaults). Confirm it with
 `bench doctor`, which now both imports roadrunner and runs the native load
 self-test on BNGsim's core.
 
-## AMICI / COPASI CLI (future reference engines)
+## COPASI (prepared) and AMICI (next reference engine)
 
-Neither is wired into the suite yet (they are drop-in `REFERENCE_ENGINES`
-entries per `docs/DESIGN.md` section 5.2). For aarch64 when the time comes:
+Both are drop-in `REFERENCE_ENGINES` entries per `docs/DESIGN.md` section 5.2.
+The `CopasiODE` adapter, its `pixi.toml` pins, `env.copasi_identity()`, and the
+`bench doctor` import check are all in place; the registry entry (the one-line
+"flip" that re-ids and re-runs the ODE corpus) is held back until the
+cross-platform timing leg finishes, so the two platform legs stay comparable.
 
-- **AMICI** publishes a PyPI **sdist**, so `uv pip install amici` compiles it
-  locally (SUNDIALS is vendored; no LLVM). A native toolchain is enough.
-- **COPASI CLI** is a plain CMake C++ build from source if no aarch64 prebuilt
-  is available (no LLVM).
+- **COPASI** needs **no build on any platform**. `python-copasi` (the SWIG
+  bindings carrying the native engine) ships cp312 `manylinux_2_28` wheels for
+  both x86-64 and aarch64, and `copasi-basico` (the `basico` wrapper the adapter
+  drives) is pure Python. The aarch64 wheel's `manylinux_2_28` floor matches the
+  cluster's glibc 2.28, so it installs on an ordinary aarch64 run environment
+  with no compiler. Read **concentrations**, not particle numbers — BNG-derived SBML uses
+  a unit compartment, so a species' concentration equals its amount numerically
+  (what BNGsim reports), while COPASI's particle *number* is that amount times
+  Avogadro.
+- **AMICI** is the next engine to land (its own PR, alongside its `pixi.toml`
+  pins and `bench doctor` self-test). It publishes a PyPI **sdist on every
+  platform** (never a wheel), so `uv pip install amici` compiles the C++/SWIG
+  core locally on x86-64 and aarch64 alike (SUNDIALS is vendored; no LLVM). It
+  also compiles a fresh C++ module per model at runtime via `sbml2amici`, using
+  `$CC`/`$CXX` — so the conda-toolchain ABI discipline that the BNGsim core needs
+  (build against the env's own libstdc++, not the system GCC 8.5) applies to
+  AMICI's compiler too, on both platforms.

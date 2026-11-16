@@ -386,6 +386,30 @@ def _check_roadrunner_loads(env) -> bool:
     return True
 
 
+def _check_copasi_loads(env) -> bool:
+    """Whether COPASI, the SBML reference ODE engine driven through BASICO, works here.
+
+    The environment is pinned to install it (``copasi-basico`` + ``python-copasi``
+    on PyPI, imported as ``basico`` / ``COPASI``); a missing or unimportable
+    package is a broken environment, so this FAILs rather than warns. The version
+    comes from metadata without the import; the import then confirms the native
+    ``python-copasi`` extension actually loads on this host (e.g. the aarch64 wheel
+    against the node's glibc).
+    """
+    ident = env.copasi_identity()
+    if not ident.get("version"):
+        print(f"FAIL COPASI: {ident.get('error') or 'not installed'} "
+              "(pinned in pixi.toml as `copasi-basico` + `python-copasi`)")
+        return False
+    try:
+        import basico  # noqa: F401
+    except Exception as exc:  # noqa: BLE001
+        print(f"FAIL COPASI {ident['version']} does not import: {type(exc).__name__}: {exc}")
+        return False
+    print(f"OK   COPASI {ident['version']} imports (basico {ident.get('basico')})")
+    return True
+
+
 def _encoding_is_utf8(enc: str) -> bool:
     """Whether ``enc`` names UTF-8, however it is spelled (``UTF-8``, ``utf8``)."""
     try:
@@ -430,6 +454,7 @@ def cmd_doctor(args) -> int:
     if not g.get("error"):
         ok = _check_run_network_loads(env) and ok
     ok = _check_roadrunner_loads(env) and ok
+    ok = _check_copasi_loads(env) and ok
     rec = parity_core_record()
     for name, want in rec["files"].items():
         if sha256_file(VENDOR_JSON.parent / "parity_core" / name) != want:

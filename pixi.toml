@@ -46,6 +46,17 @@ bngsim = "==0.17.2"
 # leaving this pin untouched. See docs/BUILD_NOTES.md; the ARM leg is the
 # cross-platform gate's (docs/DESIGN.md section 9.1).
 libroadrunner = "==2.11.0"
+# COPASI, a third reference ODE engine, driven through BASICO (`copasi-basico`,
+# imported as `basico`), a pure-Python wrapper over the SWIG bindings. basico 0.92
+# is `py3-none-any`; the native code lives in `python-copasi`, pinned explicitly so
+# the lock is reproducible. python-copasi 4.48.311 ships cp312 manylinux_2_28
+# wheels for BOTH x86_64 and linux-aarch64 (and macosx arm64) -- so unlike
+# libRoadRunner, COPASI needs no from-source build on any platform the suite runs
+# on. The adapter reads SBML exported from the same `.net` (see ode.py). Not yet in
+# REFERENCE_ENGINES: adding it re-ids the ODE corpus, deferred past the section 9.1
+# cross-platform timing leg (docs/DESIGN.md section 9.1).
+copasi-basico = "==0.92"
+python-copasi = "==4.48.311"
 bngsim-benchmarks = { path = ".", editable = true }
 
 [activation.env]
