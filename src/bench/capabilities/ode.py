@@ -131,10 +131,15 @@ def jobs(problem: Problem) -> list[Job]:
         "source_sha256": problem.source["sha256"],
         "protocol": proto,
         "setting": {"solver": "auto", "codegen": "auto"},
-        # The libRoadRunner version keys only this capability's freshness, not the
-        # global per-kind fingerprint: a roadrunner change restales ode results,
-        # never a future capability that does not use it (see env.fingerprint).
-        "reference_versions": {"roadrunner": env.roadrunner_identity().get("version")},
+        # The reference-engine versions key only this capability's freshness, not
+        # the global per-kind fingerprint: a roadrunner/copasi/amici change restales
+        # ode results, never a future capability that does not use it (see
+        # env.fingerprint). run_network's version rides the global fingerprint.
+        "reference_versions": {
+            "roadrunner": env.roadrunner_identity().get("version"),
+            "copasi": env.copasi_identity().get("version"),
+            "amici": env.amici_identity().get("version"),
+        },
     }
     species = problem.size.get("species", 100)
     correctness = Job(
@@ -620,10 +625,12 @@ class AmiciODE:
 
 
 # The reference engines BNGsim is compared against, in a fixed order. run_network
-# builds from the ``.net``; roadrunner (and, later, amici/copasi) from the SBML.
+# builds from the ``.net``; roadrunner, copasi and amici from the SBML.
 REFERENCE_ENGINES: dict[str, type] = {
     RunNetworkODE.NAME: RunNetworkODE,
     RoadRunnerODE.NAME: RoadRunnerODE,
+    CopasiODE.NAME: CopasiODE,
+    AmiciODE.NAME: AmiciODE,
 }
 
 

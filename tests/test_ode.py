@@ -75,14 +75,19 @@ def test_registry_emits_one_correctness_and_one_timing_job(spec_data, write_spec
     assert all(ode.engines_id() in j.id for j in emitted)
 
 
-def test_roadrunner_version_is_part_of_the_ode_freshness_key(spec_data, write_spec, monkeypatch):
-    # The reference engine's version keys only this capability's freshness (it is
-    # in the job definition, hence canonical()), never the global per-kind
-    # fingerprint, so a roadrunner change restales ode results alone.
+def test_reference_versions_are_part_of_the_ode_freshness_key(spec_data, write_spec, monkeypatch):
+    # Each SBML-reading reference engine's version keys only this capability's
+    # freshness (it is in the job definition, hence canonical()), never the global
+    # per-kind fingerprint, so a roadrunner/copasi/amici change restales ode
+    # results alone. run_network's version rides the global fingerprint, not here.
     monkeypatch.setattr(ode.env, "roadrunner_identity", lambda: {"version": "9.9.9"})
+    monkeypatch.setattr(ode.env, "copasi_identity", lambda: {"version": "4.48.311"})
+    monkeypatch.setattr(ode.env, "amici_identity", lambda: {"version": "1.1.0"})
     problem = specs.load(write_spec(spec_data))
     correctness, _ = ode.jobs(problem)
-    assert correctness.definition["reference_versions"] == {"roadrunner": "9.9.9"}
+    assert correctness.definition["reference_versions"] == {
+        "roadrunner": "9.9.9", "copasi": "4.48.311", "amici": "1.1.0",
+    }
     assert "reference_versions" in correctness.canonical()
 
 
