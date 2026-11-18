@@ -158,12 +158,15 @@ _ANSWER_OUTCOMES = (_tasks.ANSWER, _tasks.REFUSAL, "failure")
 _SHOWN = 60  # how much of an agent's own text a problem quotes
 _MAX_SLIPS = 20  # how many slips of one kind a grade lists before it counts the rest
 _MAX_DIGITS = 400  # an integer longer than this is read as infinite, unconverted
-# A number as JSON writes it, and the words for the non-finite ones that
-# Python's JSON reader takes: what an agent may put in quotes and mean a number.
+# A number as JSON writes it, with a sign allowed in front as it is for the
+# words for the non-finite ones that Python's JSON reader takes: what an agent
+# may put in quotes and mean a number. re.ASCII is load-bearing: under Unicode
+# case folding the dotless i of "ınf" matches "inf", and float() refuses it.
 _NUMBER_TEXT = re.compile(
-    r"-?(0|[1-9][0-9]*)(\.[0-9]+)?([eE][+-]?[0-9]+)?|[+-]?(nan|inf|infinity)",
+    r"[+-]?((0|[1-9][0-9]*)(\.[0-9]+)?([eE][+-]?[0-9]+)?|nan|inf|infinity)",
     re.IGNORECASE | re.ASCII,
 )
+_ASCII_SPACE = " \t\n\r"
 
 
 def _cut(text: Any) -> tuple[str, bool]:
@@ -196,10 +199,14 @@ def _as_float(v: Any) -> float | None:
     float is infinite, which no tolerance admits."""
     if isinstance(v, bool) or not isinstance(v, (numbers.Real, Decimal)):
         return None
+    if isinstance(v, Decimal) and v.is_snan():
+        return math.nan  # float() refuses a signalling NaN; it is a NaN all the same
     try:
         return float(v)
     except OverflowError:
         return math.inf if v > 0 else -math.inf
+    except (ValueError, TypeError, ArithmeticError):
+        return None
 
 
 def _number_written(v: Any) -> tuple[float | None, str]:
@@ -212,8 +219,8 @@ def _number_written(v: Any) -> tuple[float | None, str]:
     number = _as_float(v)
     if number is not None:
         return number, ""
-    if isinstance(v, str) and _NUMBER_TEXT.fullmatch(v.strip()):
-        return float(v.strip()), "a number written as text"
+    if isinstance(v, str) and _NUMBER_TEXT.fullmatch(v.strip(_ASCII_SPACE)):
+        return float(v.strip(_ASCII_SPACE)), "a number written as text"
     if isinstance(v, (list, tuple)) and len(v) == 1 and _as_float(v[0]) is not None:
         return _as_float(v[0]), "a number written as a list"
     return None, "not a number"
@@ -238,6 +245,10 @@ def _object(pairs: list[tuple[str, Any]]) -> _Object:
 
 def _repeated(obj: Any) -> tuple[tuple[str, Any], ...]:
     return obj.repeated if isinstance(obj, _Object) else ()
+
+
+def _record(r: Any) -> bool:
+    return isinstance(r, dict) and set(r) == {"name", "value"} and isinstance(r["name"], str)
 
 
 def _parse_int(digits: str) -> int | float:
@@ -267,6 +278,8 @@ class Answer:
     check: str = ""
     notes: str = ""
     slips: tuple[str, ...] = ()
+    # Numbers under keys of their own at the top of the file, outside ``values``.
+    outside: tuple[tuple[str, float], ...] = ()
 
 
 def parse_answer(doc: Any) -> tuple[Answer | None, list[str]]:
@@ -321,12 +334,25 @@ def parse_answer(doc: Any) -> tuple[Answer | None, list[str]]:
         slips.append(f"outcome: one given is not one of {', '.join(_ANSWER_OUTCOMES)}")
     outcome = _tasks.ANSWER if _tasks.ANSWER in outcomes else outcomes[-1]
 
-    slips += [f"unknown key {_shown(k)}" for k in doc if k not in _ANSWER_KEYS]
     pairs: list[tuple[str, float]] = []
     value_slips: list[str] = []
+    # A number under a key of its own at the top of the file: kept, and graded
+    # if the task asks for a value of that name, as a wrong number is wherever
+    # it is written.
+    outside = tuple(
+        (str(k), number)
+        for k, v in list(repeated) + list(doc.items())
+        if k not in _ANSWER_KEYS and (number := _number_written(v)[0]) is not None
+    )
+    slips += [f"unknown key {_shown(k)}" for k in doc if k not in _ANSWER_KEYS]
     for values in [v for k, v in repeated if k == "values"] + [doc.get("values")]:
         if values is None:
             continue
+        if isinstance(values, list) and values and all(_record(r) for r in values):
+            # A list of records, [{"name": ..., "value": ...}], read as the
+            # object it stands for.
+            slips.append("values: a list of records, not an object")
+            values = _object([(r["name"], r["value"]) for r in values])
         if not isinstance(values, dict):
             slips.append("values: not an object")
             continue
@@ -360,6 +386,7 @@ def parse_answer(doc: Any) -> tuple[Answer | None, list[str]]:
             check=text["check"],
             notes=text["notes"],
             slips=tuple(_capped(slips) + _capped(value_slips, " about values")),
+            outside=outside,
         ),
         [],
     )
@@ -459,7 +486,12 @@ def grade(
     slips = parsed.slips
     if answered and expected == _tasks.ANSWER:
         worst: dict[str, float] = {}
-        for name, number in parsed.values:
+        given = list(parsed.values)
+        for name, number in parsed.outside:
+            if name in asked:
+                given.append((name, number))
+                slips += (f"values.{_name(name)}: given outside values",)
+        for name, number in given:
             if name in asked:
                 v = task.value(name)
                 m = miss(number, v.reference, rel_tol=v.rel_tol, abs_tol=v.abs_tol)
@@ -650,6 +682,22 @@ def paired_difference(
     )
 
 
+def _order(value: Any) -> tuple[int, Any]:
+    """A cell key's field, in an order every field's values share: None
+    first, outcomes and causes in their report order, numbers as numbers
+    (repetitions, a miss), the rest as text. A cause is None on every job that
+    needs none, so grouping by it mixes the two."""
+    if value is None:
+        return (0, 0)
+    if isinstance(value, Outcome):
+        return (1, ALL.index(value))
+    if isinstance(value, Cause):
+        return (1, list(Cause).index(value))
+    if isinstance(value, (bool, int, float)):
+        return (2, value)
+    return (3, str(value))
+
+
 @dataclass(frozen=True)
 class Cell:
     """One row of the outcome table: the jobs of one engine and arm (or of
@@ -708,7 +756,7 @@ def summarize(
             completion=rate(cell, COMPLETE, **kw),
             counts=tally(job.outcome for job in cell),
         )
-        for key, cell in sorted(cells.items())
+        for key, cell in sorted(cells.items(), key=lambda kv: tuple(map(_order, kv[0])))
     ]
 
 

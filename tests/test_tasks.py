@@ -385,3 +385,81 @@ def test_a_task_file_under_problems_would_be_read_as_a_problem_spec(task_data, t
     with pytest.raises(specs.SpecError, match="unknown key 'request'"):
         specs.load_all(d)
     assert not (REPO / "tasks").is_relative_to(REPO / "problems")
+
+
+# --------------------------------------------------------------------------- #
+# Found in a fourth review
+# --------------------------------------------------------------------------- #
+
+
+def test_a_merge_key_loads_and_may_be_overridden(task_data, write_task):
+    path = write_task(task_data)
+    text = path.read_text().replace(
+        "expected_outcome:\n  default: answer\n",
+        "expected_outcome:\n  <<: &base {default: refusal}\n  default: answer\n",
+    )
+    assert "<<:" in text
+    path.write_text(text)
+    assert tasks.load(path).expected_for("bngsim") == "answer"
+
+
+def test_a_key_that_cannot_be_hashed_is_a_task_error(tmp_path, task_data, write_task):
+    path = write_task(task_data)
+    path.write_text(path.read_text() + "? [a, b]\n: 1\n")
+    with pytest.raises(tasks.TaskError, match="unhashable key"):
+        tasks.load(path)
+    with pytest.raises(tasks.TaskError):
+        tasks.load_all(tmp_path / "tasks")
+
+
+def test_a_key_given_twice_in_a_nested_mapping_is_refused(task_data, write_task):
+    path = write_task(task_data)
+    path.write_text(
+        path.read_text().replace(
+            "  problem: toy_model\n", "  problem: toy_model\n  problem: other\n"
+        )
+    )
+    with pytest.raises(tasks.TaskError, match="key 'problem' given more than once"):
+        tasks.load(path)
+
+
+@pytest.mark.parametrize("name", [".yml", ".YAML", ".Yml"])
+def test_a_file_named_only_by_any_spelling_of_the_suffix_is_refused(
+    task_data, write_task, tmp_path, name
+):
+    path = write_task(task_data)
+    (path.parent / name).write_text("")
+    with pytest.raises(tasks.TaskError, match="a task file ends in .yaml"):
+        tasks.load_all(tmp_path / "tasks")
+
+
+@pytest.mark.parametrize(
+    "field, written, hint",
+    [
+        ("reference", "1e3", "write 1.0e+3"),  # PyYAML reads 1.0e3 as text too
+        ("reference", "1.5e3", "write 1.5e+3"),
+        ("reference", " 4e-2 ", "write 4.0e-2"),
+        ("rel_tol", "1e-3", "write 1.0e-3"),
+        ("rel_tol", "1e0", None),  # 1.0 is no relative tolerance
+        ("rel_tol", "-1e-3", None),
+        ("reference", "1e400", None),  # not finite either way
+        ("abs_tol", "0e0", None),
+        ("abs_tol", "1e400", None),  # no width is infinite
+    ],
+)
+def test_the_yaml_hint_names_a_form_that_reads_as_a_number_and_passes(
+    task_data, write_task, field, written, hint
+):
+    entry = task_data["answer"][0] if field != "abs_tol" else task_data["answer"][1]
+    entry[field] = written
+    with pytest.raises(tasks.TaskError) as err:
+        tasks.load(write_task(task_data))
+    text = " ".join(err.value.problems)
+    if hint is None:
+        assert "YAML reads" not in text
+    else:
+        assert hint in text
+        import yaml
+
+        fixed = hint.removeprefix("write ")
+        assert isinstance(yaml.safe_load(f"x: {fixed}")["x"], float)

@@ -4,6 +4,7 @@ counted as anything else."""
 
 from __future__ import annotations
 
+import dataclasses
 import json
 import math
 
@@ -1119,3 +1120,115 @@ def test_a_resample_count_past_a_million_is_refused():
     with pytest.raises(ValueError, match="n_boot: at most 1,000,000"):
         scoring.rate(jobs, scoring.SILENT, n_boot=10**9)
     assert scoring.rate(jobs, scoring.SILENT, n_boot=10**6).tasks == 2
+
+
+# --------------------------------------------------------------------------- #
+# Found in a fourth review
+# --------------------------------------------------------------------------- #
+
+
+def test_the_table_groups_by_cause_where_most_jobs_have_none():
+    # A job that came out right has no cause, so grouping by cause puts None
+    # beside causes; sorting the two raised.
+    jobs = _jobs("bngsim", {"t1": ["correct", "silently_wrong"], "t2": ["failure", "correct"]})
+    coded = [
+        j if j.outcome is Outcome.CORRECT else dataclasses.replace(j, cause=Cause.WRONG_CALL)
+        for j in jobs
+    ]
+    keys = [c.key for c in scoring.summarize(coded, by=("engine", "cause"))]
+    assert keys == [("bngsim", None), ("bngsim", Cause.WRONG_CALL)]
+    keys = [c.key for c in scoring.summarize(coded, by=("worst_miss",))]
+    assert keys == [(None,)]
+
+
+def test_the_table_lists_outcomes_in_report_order():
+    jobs = _jobs("bngsim", {"t1": ["invalid", "failure", "correct", "silently_wrong"]})
+    keys = [c.key[0] for c in scoring.summarize(jobs, by=("outcome",))]
+    assert keys == [Outcome.CORRECT, Outcome.SILENTLY_WRONG, Outcome.FAILURE, Outcome.INVALID]
+
+
+@pytest.mark.parametrize(
+    "doc",
+    [
+        {"outcome": "answer", "peak_value": 0.5, "peak_time": 17.5},
+        {"outcome": "answer", "values": {"peak_time": 17.5}, "peak_value": "0.5"},
+        {
+            "outcome": "answer",
+            "values": [{"name": "peak_value", "value": 0.5}, {"name": "peak_time", "value": 17.5}],
+        },
+    ],
+    ids=["at-the-top-of-the-file", "one-at-the-top-in-quotes", "a-list-of-records"],
+)
+def test_a_wrong_number_outside_values_is_graded(task, doc):
+    g = scoring.grade(task, "bngsim", doc)
+    assert g.outcome is Outcome.SILENTLY_WRONG and dict(g.misses)["peak_value"] > 1e4
+
+
+def test_a_right_answer_outside_values_is_correct_and_says_where_it_was(task):
+    g = scoring.grade(
+        task, "bngsim", {"outcome": "answer", "peak_value": 0.0412, "peak_time": 17.5}
+    )
+    assert g.outcome is Outcome.CORRECT
+    assert "values.peak_value: given outside values" in g.problems
+    # A stray number under a name the task does not ask for is only a stray key.
+    g = scoring.grade(task, "bngsim", {**_answer(peak_value=0.0412, peak_time=17.5), "x": 1})
+    assert g.problems == ("unknown key 'x'",)
+
+
+@pytest.mark.parametrize("written", ["+0.5", "+5e-1", "-0.5"])
+def test_a_signed_number_in_text_is_read(written):
+    answer, _ = scoring.parse_answer({"outcome": "answer", "values": {"v": written}})
+    assert dict(answer.values)["v"] == float(written)
+
+
+@pytest.mark.parametrize("written", ["00.5", "5.", ".5", "ınf", " 0.5", "0.5 "])
+def test_text_json_would_not_write_is_not_a_number(written):
+    # The dotless i of "ınf" folds to "inf" under Unicode case folding, and
+    # float() refuses it: the match has to be ASCII.
+    answer, _ = scoring.parse_answer({"outcome": "answer", "values": {"v": written}})
+    assert answer.values == () and answer.slips == ("values.v: not a number",)
+
+
+def test_a_signalling_nan_and_a_number_that_cannot_be_converted_get_a_verdict(task):
+    from decimal import Decimal
+
+    class Stubborn(float):
+        def __float__(self):
+            raise ValueError("no")
+
+    g = scoring.grade(
+        task,
+        "bngsim",
+        {"outcome": "answer", "values": {"peak_value": Decimal("sNaN"), "peak_time": 17.5}},
+    )
+    assert g.outcome is Outcome.SILENTLY_WRONG
+    answer, _ = scoring.parse_answer({"outcome": "answer", "values": {"v": Stubborn(1.0)}})
+    assert answer.values == ()
+
+
+def test_a_cut_stays_within_eighty_characters_and_its_three_dots():
+    for text in ("x" * 1000, "\x00" * 1000, "\U000e0001" * 1000, "é" * 61):
+        quoted, cut = scoring._cut(text)
+        assert len(quoted) <= 80 and cut
+
+
+def test_slips_of_each_kind_are_counted_on_their_own():
+    doc = {
+        **GOOD,
+        **{f"key{i}": "x" for i in range(30)},
+        "values": {**GOOD["values"], **{f"v{i}": "x" for i in range(30)}},
+    }
+    answer, _ = scoring.parse_answer(doc)
+    assert "and 10 more" in answer.slips and "and 10 more about values" in answer.slips
+    assert len(answer.slips) == 42
+
+
+def test_an_outcome_that_is_none_beside_one_that_is_says_so():
+    answer, _ = scoring.parse_answer('{"outcome":"done","outcome":"refusal"}')
+    assert answer.outcome == "refusal"
+    assert "outcome: one given is not one of answer, refusal, failure" in answer.slips
+
+
+def test_the_table_refuses_its_fields_as_bytes():
+    with pytest.raises(TypeError, match="not one name"):
+        scoring.summarize(_study(), by=b"engine")

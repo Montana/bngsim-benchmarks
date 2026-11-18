@@ -19,7 +19,7 @@ from __future__ import annotations
 
 import math
 import re
-from collections.abc import Iterable
+from collections.abc import Callable, Iterable
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -152,28 +152,34 @@ def _number(v: Any) -> bool:
         return False
 
 
-_EXPONENT_WITHOUT_POINT = re.compile(r"[+-]?[0-9]+[eE][+-]?[0-9]+")
+# PyYAML's float needs a decimal point and a sign on the exponent: 1.0e-3 and
+# 1.0e+3 are numbers, 1e-3 and 1.0e3 are text.
+_EXPONENT_WITHOUT_POINT = re.compile(r"[+-]?([0-9]+[eE][+-]?|[0-9]*\.[0-9]*[eE])[0-9]+")
 
 
-def _yaml_hint(v: Any, *, positive: bool = False) -> str:
+def _yaml_hint(v: Any, *, passes: Callable[[float], bool] = math.isfinite) -> str:
     """For a number YAML read as text because it has an exponent and no decimal
-    point (``1e-3``; issue #13's own example is written that way), and that
-    would pass written with one. Nothing for other text, which a decimal point
-    would not mend."""
+    point, or no sign on its exponent (``1e-3``, ``1.0e3``; issue #13's own
+    example is written the first way), and whose number would pass this field's
+    own check. The form given is one PyYAML reads as a number. Nothing for
+    other text, which rewriting would not mend; a tolerance may still fail
+    beside its reference."""
     if not isinstance(v, str) or not _EXPONENT_WITHOUT_POINT.fullmatch(v.strip()):
         return ""
     number = float(v)
-    if not math.isfinite(number) or (positive and not 0 < number):
+    if not (math.isfinite(number) and passes(number)):
         return ""
     mantissa, exponent = v.strip().lower().split("e")
-    return f" (YAML reads {v.strip()} as text: write {mantissa}.0e{exponent})"
+    mantissa = mantissa if "." in mantissa else mantissa + ".0"
+    exponent = exponent if exponent[0] in "+-" else "+" + exponent
+    return f" (YAML reads {v.strip()} as text: write {mantissa}e{exponent})"
 
 
 def _spacing(x: float) -> float:
-    """The narrowest gap between doubles beside ``x``: below a power of two
-    the doubles are closer than above it."""
+    """The narrowest gap between doubles beside ``x``: the gap below it, which
+    at a power of two is half the one above."""
     x = abs(x)
-    return math.ulp(0.0) if x == 0 else min(math.ulp(x), x - math.nextafter(x, 0.0))
+    return math.ulp(0.0) if x == 0 else x - math.nextafter(x, 0.0)
 
 
 def _validate_answer(answer: Any, errs: list[str]) -> tuple[Value, ...]:
@@ -205,7 +211,10 @@ def _validate_answer(answer: Any, errs: list[str]) -> tuple[Value, ...]:
         for k in ("rel_tol", "abs_tol"):
             if k in entry:
                 if not _number(entry[k]) or entry[k] <= 0:
-                    hint = _yaml_hint(entry[k], positive=True)
+                    if k == "rel_tol":
+                        hint = _yaml_hint(entry[k], passes=lambda x: 0 < x < 1)
+                    else:
+                        hint = _yaml_hint(entry[k], passes=lambda x: 0 < x)
                     errs.append(f"{where}.{k}: must be a positive number{hint}")
                 elif k == "rel_tol" and entry[k] >= 1:
                     # Within 100% of the reference, 0 and the wrong sign pass.
@@ -380,10 +389,24 @@ class _UniqueKeyLoader(yaml.SafeLoader):
     load as public, past the check that keeps held-out tasks out."""
 
     def construct_mapping(self, node, deep=False):
+        # A merge key, `<<: *base`, brings in another mapping's keys, and a key
+        # of this mapping may override one of those: YAML's own rule, written
+        # on purpose. Only keys this mapping names itself are checked.
         seen = set()
         for key_node, _ in node.value:
+            if key_node.tag == "tag:yaml.org,2002:merge":
+                continue
             key = self.construct_object(key_node, deep=deep)
-            if key in seen:
+            try:
+                repeated = key in seen
+            except TypeError:
+                raise yaml.constructor.ConstructorError(
+                    "while constructing a mapping",
+                    node.start_mark,
+                    "found unhashable key",
+                    key_node.start_mark,
+                ) from None
+            if repeated:
                 raise yaml.constructor.ConstructorError(
                     None, None, f"key {key!r} given more than once", key_node.start_mark
                 )
