@@ -640,6 +640,94 @@ def test_timing_prep_failure_is_a_bad_test_row_not_an_exception(monkeypatch):
     assert "UnicodeDecodeError" in rec["error"]
 
 
+def _timing_job(min_rounds=2, max_rounds=2):
+    # A stand-in Job carrying only what run_timing reads: the timing protocol.
+    return types.SimpleNamespace(definition={"timing": {
+        "warmup_rounds": 1, "min_rounds": min_rounds, "max_rounds": max_rounds,
+        "budget_seconds": 0.0}})
+
+
+def _fake_bngsim():
+    class FakeBngsim:
+        def __init__(self, net, proto):
+            pass
+
+        def run(self):
+            return _decay()
+
+        warm = run
+
+        @staticmethod
+        def trajectory(values):
+            return np.asarray(values)
+
+        def config(self, result=None):
+            return {"codegen_backend": "fake", "linear_solver": "dense"}
+
+    return FakeBngsim
+
+
+def _fake_reference(error=None):
+    # An SBML-reading reference like roadrunner/copasi: constructs from prep and
+    # runs to a fixed trajectory, or raises in run()/warm() to model a crasher.
+    class FakeRef:
+        INPUT = "sbml"
+
+        def __init__(self, sbml, species_names, name_to_id, proto):
+            pass
+
+        def run(self):
+            if error:
+                raise RuntimeError(error)
+            return _decay()
+
+        warm = run
+
+        @staticmethod
+        def trajectory(values):
+            return np.asarray(values)
+
+        def config(self):
+            return {"engine": "fake"}
+
+    return FakeRef
+
+
+def test_timing_drops_a_crashing_reference_and_times_the_rest(monkeypatch):
+    # The 5-engine shakedown case: one reference (like COPASI on beta_catenin)
+    # raises inside run(), not __init__. It must be recorded and dropped from the
+    # timed set while BNGsim and the surviving references are still timed -- never
+    # crash the whole timing job (as it would without per-engine fault isolation).
+    proto = {"t_start": 0, "t_end": 10, "n_steps": 100, "rtol": 1e-8, "atol": 1e-6,
+             "sparse": False}
+    prep = {"net": Path("m.net"), "sbml": Path("m.xml"), "proto": proto, "info": {},
+            "species_names": ["A()", "B()"], "name_to_id": {"A()": "idA", "B()": "idB"}}
+    monkeypatch.setattr(ode, "_prepare", lambda problem, ctx: prep)
+    monkeypatch.setattr(ode, "BngsimODE", _fake_bngsim())
+    monkeypatch.setattr(ode, "REFERENCE_ENGINES", {
+        "good": _fake_reference(),
+        "bad": _fake_reference(error="KeyError: \"['I'] not in index\""),
+    })
+
+    rec = ode.run_timing(job=_timing_job(), problem=None,
+                         ctx={"workdir": ".", "subprocess_timeout": 60})
+
+    m = rec["measurements"]
+    # BNGsim and the surviving reference are timed; the crasher is not.
+    assert set(m["times"]) == {"bngsim", "good"}
+    assert "bad" not in m["references"] and "good" in m["references"]
+    # The failure is recorded and attributed, exactly as the correctness job does.
+    assert rec["bad_error"].startswith("RuntimeError") and "['I']" in rec["bad_error"]
+    assert "bad_error" not in m and "good_error" not in rec
+    # engine_roles is derived from the surviving engines, so it never lists a
+    # dropped engine (nor drifts from the registry).
+    assert set(m["engine_roles"]) == {"bngsim", "good"}
+    # A dropped reference does not fail the row; the survivors reproduced.
+    assert rec["outcome"] == "PASS"
+    assert m["reproducibility"]["good"]["passed"] is True
+    assert "bad" not in m["reproducibility"]
+
+
 def test_correctness_prep_failure_is_a_bad_test_row(monkeypatch):
     def boom(problem, ctx):
         raise RuntimeError("BNG2.pl network generation failed")
