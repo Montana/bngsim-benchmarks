@@ -45,8 +45,9 @@ SHOULD_REFUSE = "should_refuse"
 # reads no BNGL.
 FORMS = ("sbml", "bngl")
 
-# The engines an agent job can name (issue #15), by the names the suite's
-# environment records use. ``expected_outcome`` may set an outcome for each.
+# The engines an agent job can name (issue #15): libRoadRunner, with Tellurium,
+# as ``roadrunner``, and BioNetGen through PyBioNetGen as ``bionetgen``, the
+# names ``bench.env`` uses. ``expected_outcome`` may set an outcome for each.
 ENGINES = ("bngsim", "roadrunner", "amici", "copasi", "bionetgen")
 
 ANSWER = "answer"
@@ -143,7 +144,12 @@ class Task:
 def _number(v: Any) -> bool:
     """A finite number. A bool is not one, and neither is ``1e-3`` written without
     its decimal point, which YAML reads as a string."""
-    return isinstance(v, (int, float)) and not isinstance(v, bool) and math.isfinite(v)
+    if isinstance(v, bool) or not isinstance(v, (int, float)):
+        return False
+    try:
+        return math.isfinite(float(v))
+    except OverflowError:  # an integer no float holds
+        return False
 
 
 def _validate_answer(answer: Any, errs: list[str]) -> tuple[Value, ...]:
@@ -162,7 +168,7 @@ def _validate_answer(answer: Any, errs: list[str]) -> tuple[Value, ...]:
             if k not in ("name", "reference", "rel_tol", "abs_tol"):
                 errs.append(f"{where}: unknown key {k!r}")
         name = entry.get("name")
-        if not isinstance(name, str) or not _VALUE_RE.match(name):
+        if not isinstance(name, str) or not _VALUE_RE.fullmatch(name):
             errs.append(f"{where}.name: letters, digits and '_', not starting with a digit")
         elif name in seen:
             errs.append(f"{where}.name: {name!r} is named twice")
@@ -175,14 +181,26 @@ def _validate_answer(answer: Any, errs: list[str]) -> tuple[Value, ...]:
         for k in ("rel_tol", "abs_tol"):
             if k in entry:
                 if not _number(entry[k]) or entry[k] <= 0:
-                    errs.append(f"{where}.{k}: must be a positive number")
+                    hint = ""
+                    if isinstance(entry[k], str):
+                        # Issue #13's own example has `rel_tol: 1e-3`.
+                        hint = " (YAML reads 1e-3 as text: write 1.0e-3)"
+                    errs.append(f"{where}.{k}: must be a positive number{hint}")
+                elif k == "rel_tol" and entry[k] >= 1:
+                    # Within 100% of the reference, 0 and the wrong sign pass.
+                    errs.append(f"{where}.rel_tol: must be below 1")
                 else:
                     tols[k] = float(entry[k])
         if "rel_tol" not in entry and "abs_tol" not in entry:
             errs.append(f"{where}: needs 'rel_tol', 'abs_tol' or both")
-        elif _number(reference) and reference == 0 and "abs_tol" not in entry:
-            # Relative to a reference of 0 nothing but 0 itself is within tolerance.
-            errs.append(f"{where}: a reference of 0 needs an 'abs_tol'")
+        elif (
+            _number(reference)
+            and len(tols) == ("rel_tol" in entry) + ("abs_tol" in entry)
+            and tols.get("abs_tol", 0.0) + tols.get("rel_tol", 0.0) * abs(reference) <= 0
+        ):
+            # Relative to a reference of 0, or one so small the product is 0,
+            # nothing but the reference itself is within tolerance.
+            errs.append(f"{where}: a tolerance that is 0 at this reference needs an 'abs_tol'")
         if len(errs) == before:
             values.append(Value(name=name, reference=float(reference), **tols))
     return tuple(values)
@@ -231,7 +249,7 @@ def validate(data: Any, path: str | Path) -> Task:
         errs.append(f"category: one of {', '.join(CATEGORIES)}")
     if "id" in data:
         parts = tid.split("/") if isinstance(tid, str) else []
-        if len(parts) != 3 or parts[0] != _PREFIX or not _NAME_RE.match(parts[2]):
+        if len(parts) != 3 or parts[0] != _PREFIX or not _NAME_RE.fullmatch(parts[2]):
             errs.append(
                 f"id: '{_PREFIX}/<category>/<name>', the name in lowercase letters, digits and '_'"
             )
@@ -329,7 +347,11 @@ def validate(data: Any, path: str | Path) -> Task:
 def load(path: str | Path) -> Task:
     path = Path(path)
     try:
-        data = yaml.safe_load(path.read_text(encoding="utf-8"))
+        text = path.read_text(encoding="utf-8")
+    except (OSError, UnicodeDecodeError) as exc:
+        raise TaskError(path, [f"cannot be read as UTF-8 text: {exc}"]) from exc
+    try:
+        data = yaml.safe_load(text)
     except yaml.YAMLError as exc:
         raise TaskError(path, [f"not valid YAML: {exc}"]) from exc
     return validate(data, path)
@@ -358,6 +380,10 @@ def load_all(
             tasks.append(load(path))
         except TaskError as exc:
             errors.append(exc)
+    # A task under another suffix would be skipped, and with it the check that
+    # keeps a held-out task out of the repository.
+    for path in sorted(root.rglob("*.yml")):
+        errors.append(TaskError(path, ["a task file ends in .yaml"]))
     if errors:
         raise TaskError(root, [str(e) for e in errors])
     seen: dict[str, str] = {}

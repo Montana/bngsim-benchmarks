@@ -12,7 +12,9 @@ from bench import specs, tasks
 
 
 def test_valid_task_loads(task_data, write_task):
+    task_data["request"] = "  " + task_data["request"] + "\n"
     t = tasks.load(write_task(task_data))
+    assert t.request == VALID_TASK["request"]
     assert t.id == "agent/timecourse/toy_peak"
     assert t.name == "toy_peak"
     assert t.category == "timecourse"
@@ -99,10 +101,16 @@ def _drop(*path):
         (_set(["answer", 0, "reference"], float("nan")), "answer[0].reference: must be a finite"),
         (_set(["answer", 0, "reference"], True), "answer[0].reference: must be a finite"),
         (_set(["answer", 0, "rel_tol"], 0), "answer[0].rel_tol: must be a positive number"),
-        (_set(["answer", 0, "rel_tol"], "1e-3"), "answer[0].rel_tol: must be a positive number"),
+        (_set(["answer", 0, "rel_tol"], "1e-3"), "YAML reads 1e-3 as text: write 1.0e-3"),
         (_set(["answer", 1, "abs_tol"], -0.5), "answer[1].abs_tol: must be a positive number"),
         (_drop("answer", 0, "rel_tol"), "answer[0]: needs 'rel_tol', 'abs_tol' or both"),
-        (_set(["answer", 0, "reference"], 0), "answer[0]: a reference of 0 needs an 'abs_tol'"),
+        (_set(["answer", 0, "reference"], 0), "answer[0]: a tolerance that is 0 at this reference"),
+        (_set(["answer", 0, "reference"], 1e-323), "answer[0]: a tolerance that is 0 at this ref"),
+        (_set(["answer", 0, "reference"], 10**400), "answer[0].reference: must be a finite"),
+        (_set(["answer", 0, "rel_tol"], 10**400), "answer[0].rel_tol: must be a positive number"),
+        (_set(["answer", 0, "rel_tol"], 1), "answer[0].rel_tol: must be below 1"),
+        (_set(["answer", 0, "name"], "peak_value\n"), "answer[0].name: letters, digits and '_'"),
+        (_set(["id"], "agent/timecourse/toy_peak\n"), "id: 'agent/<category>/<name>'"),
         (_set(["answer", 0, "units"], "nM"), "answer[0]: unknown key 'units'"),
         (_set(["expected_outcome"], "answer"), "expected_outcome: a mapping with 'default'"),
         (_set(["expected_outcome"], {"bngsim": "answer"}), "expected_outcome: missing 'default'"),
@@ -140,6 +148,59 @@ def test_every_problem_reported_at_once(task_data, write_task):
     assert len(err.value.problems) == 3
 
 
+def test_the_example_of_the_task_issue_loads_once_its_tolerance_has_a_decimal_point(tmp_path):
+    # Issue #13 writes `rel_tol: 1e-3`, which YAML reads as text.
+    example = """\
+id: agent/timecourse/kinetic_proofreading_peak
+category: timecourse
+model: {problem: kinetic_proofreading_hlavacek2001}
+forms: [sbml, bngl]
+request: >
+  Simulate the model from its initial state for 100 seconds.
+  Report the peak value of Obs_Tot_Dimers and the time at which it occurs.
+answer:
+  - {name: peak_value, reference: 0.0412, rel_tol: 1e-3}
+  - {name: peak_time,  reference: 17.5, abs_tol: 0.5}
+expected_outcome: {default: answer}
+trap: none
+split: public
+"""
+    d = tmp_path / "tasks" / "timecourse"
+    d.mkdir(parents=True)
+    path = d / "kinetic_proofreading_peak.yaml"
+    path.write_text(example)
+    with pytest.raises(tasks.TaskError, match="YAML reads 1e-3 as text: write 1.0e-3"):
+        tasks.load(path)
+    path.write_text(example.replace("1e-3", "1.0e-3"))
+    problems = [p.id for p in specs.load_all(REPO / "problems")]
+    (loaded,) = tasks.load_all(tmp_path / "tasks", problems=problems)
+    assert loaded.value("peak_value").rel_tol == 1e-3
+    assert loaded.request.startswith("Simulate") and loaded.request.endswith("occurs.")
+
+
+def test_a_file_that_cannot_be_read_is_reported_with_the_rest(task_data, write_task, tmp_path):
+    task_data["split"] = "private"
+    write_task(task_data)
+    d = tmp_path / "tasks" / "scan"
+    d.mkdir()
+    (d / "bytes.yaml").write_bytes(b"id: \xff\xfe")
+    (d / "folder.yaml").mkdir()
+    with pytest.raises(tasks.TaskError) as err:
+        tasks.load_all(tmp_path / "tasks")
+    assert len(err.value.problems) == 3
+    assert sum("cannot be read as UTF-8 text" in p for p in err.value.problems) == 2
+
+
+def test_a_task_under_another_suffix_is_not_skipped(task_data, write_task, tmp_path):
+    # Skipped, a held-out task saved as .yml would pass the check that keeps
+    # those out of the repository.
+    task_data["split"] = "held_out"
+    path = write_task(task_data)
+    path.rename(path.with_suffix(".yml"))
+    with pytest.raises(tasks.TaskError, match="a task file ends in .yaml"):
+        tasks.load_all(tmp_path / "tasks")
+
+
 def test_not_yaml_and_not_a_mapping_are_refused(tmp_path):
     d = tmp_path / "tasks" / "timecourse"
     d.mkdir(parents=True)
@@ -157,8 +218,16 @@ def test_load_all_sorts_by_id_and_checks_the_problem_exists(task_data, write_tas
     other.update(id="agent/scan/toy_ec50", category="scan")
     write_task(other)
     root = tmp_path / "tasks"
+    # Under tasks/z/, so that the order of the paths is not the order of the ids.
+    third = copy.deepcopy(VALID_TASK)
+    third.update(id="agent/perturbation/toy_dose", category="perturbation")
+    write_task(third, directory=tmp_path / "tasks" / "z")
     loaded = tasks.load_all(root, problems=["toy_model"])
-    assert [t.id for t in loaded] == ["agent/scan/toy_ec50", "agent/timecourse/toy_peak"]
+    assert [t.id for t in loaded] == [
+        "agent/perturbation/toy_dose",
+        "agent/scan/toy_ec50",
+        "agent/timecourse/toy_peak",
+    ]
     with pytest.raises(tasks.TaskError, match="model.problem 'toy_model' is not a problem spec"):
         tasks.load_all(root, problems=["another_model"])
 
@@ -195,7 +264,14 @@ def test_committed_tasks_all_validate_against_the_committed_problems():
     assert [t.id for t in loaded] == sorted(t.id for t in loaded)
 
 
-def test_a_task_file_is_not_read_as_a_problem_spec():
-    # Every YAML file under problems/ is a problem spec, so tasks live beside it.
-    assert not list((REPO / "problems").rglob("agent*"))
-    assert all(p.parent != REPO / "problems" for p in (REPO / "tasks").rglob("*.yaml"))
+def test_a_task_file_under_problems_would_be_read_as_a_problem_spec(task_data, tmp_path):
+    # Why tasks have a directory of their own: every YAML file under problems/
+    # is a problem spec, and a task there stops the job list being built.
+    import yaml
+
+    d = tmp_path / "problems"
+    d.mkdir()
+    (d / "toy_peak.yaml").write_text(yaml.safe_dump(task_data))
+    with pytest.raises(specs.SpecError, match="unknown key 'request'"):
+        specs.load_all(d)
+    assert not (REPO / "tasks").is_relative_to(REPO / "problems")

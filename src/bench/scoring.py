@@ -34,7 +34,6 @@ from typing import Any
 import numpy as np
 
 from . import tasks as _tasks
-from ._vendor.parity_core import fingerprint as _fingerprint
 
 # --------------------------------------------------------------------------- #
 # Outcomes
@@ -131,7 +130,11 @@ def miss(value: float, reference: float, *, rel_tol: float = 0.0, abs_tol: float
     value = float(value)
     if not math.isfinite(value):
         return math.inf
-    return _fingerprint.fingerprint_distance(
+    # Imported here, as capabilities/ode.py does: the parity core needs bngsim,
+    # and nothing else in this module does.
+    from ._vendor.parity_core.fingerprint import fingerprint_distance
+
+    return fingerprint_distance(
         _as_fingerprint(value), _as_fingerprint(float(reference)), rel_tol, abs_tol
     )
 
@@ -146,64 +149,95 @@ def within(value: float, reference: float, *, rel_tol: float = 0.0, abs_tol: flo
 
 _ANSWER_KEYS = {"outcome", "values", "checked", "check", "notes"}
 _ANSWER_OUTCOMES = (_tasks.ANSWER, _tasks.REFUSAL, "failure")
+_SHOWN = 60  # how much of an agent's own text a problem quotes
+
+
+def _shown(text: Any) -> str:
+    """An agent's text, cut short: a problem names the entry, and does not carry
+    whatever the agent put there into the result."""
+    text = str(text)
+    return repr(text if len(text) <= _SHOWN else text[:_SHOWN] + "...")
+
+
+def _as_float(v: Any) -> float | None:
+    """A JSON number as a float, or None for what is not one. An integer too
+    large for a float is infinite, which no tolerance admits."""
+    if isinstance(v, bool) or not isinstance(v, (int, float)):
+        return None
+    try:
+        return float(v)
+    except OverflowError:
+        return math.inf if v > 0 else -math.inf
 
 
 @dataclass(frozen=True)
 class Answer:
-    """``answer.json``, the contract between the agent and the grader."""
+    """``answer.json``, the contract between the agent and the grader (issue
+    #15). ``slips`` are what is the matter with a file that could still be read."""
 
     outcome: str
     values: tuple[tuple[str, float], ...] = ()
     checked: bool = False
     check: str = ""
     notes: str = ""
+    slips: tuple[str, ...] = ()
 
 
 def parse_answer(doc: Any) -> tuple[Answer | None, list[str]]:
     """``(answer, problems)`` from the text or the parsed content of
-    ``answer.json``. ``answer`` is None when the file does not keep the
-    contract, and ``problems`` says how, every reason at once."""
+    ``answer.json``.
+
+    ``answer`` is None only where the file cannot be read as an answer at all:
+    there is none, it does not parse, it is not an object, it names no outcome,
+    or its values are not an object. Those are ``invalid``. Anything less is
+    read, and kept in ``Answer.slips``: an unknown key, a ``checked`` that is
+    not true or false, a value that is not a number. A slip must not move a job
+    out of the headline: a file with a wrong number in it and a stray key
+    reported a wrong number.
+    """
     if doc is None:
         return None, ["no answer file"]
     if isinstance(doc, (str, bytes)):
         try:
-            # Python's parser reads NaN and Infinity, which are not JSON.
-            doc = json.loads(
-                doc, parse_constant=lambda name: float(name.replace("Infinity", "inf"))
-            )
-        except (ValueError, UnicodeDecodeError) as exc:
-            return None, [f"not valid JSON: {exc}"]
+            doc = json.loads(doc)
+        except (ValueError, UnicodeDecodeError, RecursionError) as exc:
+            reason = "nested too deeply" if isinstance(exc, RecursionError) else str(exc)
+            return None, [f"not valid JSON: {reason}"]
     if not isinstance(doc, dict):
         return None, ["the answer must be a JSON object"]
-    problems = [f"unknown key {k!r}" for k in doc if k not in _ANSWER_KEYS]
     outcome = doc.get("outcome")
-    if outcome not in _ANSWER_OUTCOMES:
-        problems.append(f"outcome: one of {', '.join(_ANSWER_OUTCOMES)}")
+    if not isinstance(outcome, str) or outcome not in _ANSWER_OUTCOMES:
+        return None, [f"outcome: one of {', '.join(_ANSWER_OUTCOMES)}"]
     values = doc.get("values", {})
-    pairs: list[tuple[str, float]] = []
     if not isinstance(values, dict):
-        problems.append("values: an object of name and number")
-    else:
-        for name, v in values.items():
-            if isinstance(v, bool) or not isinstance(v, (int, float)):
-                problems.append(f"values.{name}: must be a number")
-            else:
-                pairs.append((str(name), float(v)))
+        return None, ["values: an object of name and number"]
+
+    slips = [f"unknown key {_shown(k)}" for k in doc if k not in _ANSWER_KEYS]
+    pairs: list[tuple[str, float]] = []
+    for name, v in values.items():
+        number = _as_float(v)
+        if number is None:
+            slips.append(f"values.{_shown(name)[1:-1]}: not a number")
+        else:
+            pairs.append((str(name), number))
     checked = doc.get("checked", False)
     if not isinstance(checked, bool):
-        problems.append("checked: must be true or false")
+        slips.append("checked: not true or false")
+        checked = False
+    text = {}
     for k in ("check", "notes"):
-        if not isinstance(doc.get(k, ""), str):
-            problems.append(f"{k}: must be text")
-    if problems:
-        return None, problems
+        text[k] = doc.get(k) or ""
+        if not isinstance(text[k], str):
+            slips.append(f"{k}: not text")
+            text[k] = ""
     return (
         Answer(
             outcome=outcome,
             values=tuple(pairs),
             checked=checked,
-            check=doc.get("check", ""),
-            notes=doc.get("notes", ""),
+            check=text["check"],
+            notes=text["notes"],
+            slips=tuple(slips),
         ),
         [],
     )
@@ -220,7 +254,8 @@ class Grade:
     # For each value the agent reported and the task asks for, how far it is
     # from its reference in units of its tolerance (``miss``).
     misses: tuple[tuple[str, float], ...] = ()
-    # Why the job is ``invalid``; empty otherwise.
+    # Why the job is ``invalid``, and the slips in a file that was read all the
+    # same; empty for a file that keeps the contract.
     problems: tuple[str, ...] = ()
     # What the agent said of its own answer (``checked`` in the answer file).
     # The transcript confirms it; this is only the claim.
@@ -241,53 +276,63 @@ def grade(
     """The outcome of one job: ``task`` on ``engine``, ending in ``answer``.
 
     ``answer`` is the text or the parsed content of ``answer.json``, or None
-    where the agent wrote none. ``engines_used`` is the import audit's list of
-    the simulation packages the job imported; a job that used another engine
-    than the one named is ``invalid``, whatever it answered.
+    where the agent wrote none. ``engine`` is the engine the job named; in the
+    ``free`` arm, where none is named, it is the one the agent chose.
 
-    An answer that leaves out a value the task asks for does not keep the
-    contract and is ``invalid``: it is not a wrong number reported as a result.
-    One that reports every value, with any of them outside its tolerance, is
-    ``silently_wrong``.
+    ``engines_used`` is the import audit's list of the simulation packages the
+    job imported, by the names in ``tasks.ENGINES``. A job that used an engine
+    other than the one named is ``invalid``, whatever it answered. One that
+    imported none is graded on what it wrote: an agent that stopped at a
+    missing compiler failed, and one that read the model and refused, refused.
+
+    A wrong number is never ``invalid``. If any value the agent reported for the
+    task is outside its tolerance the job is ``silently_wrong``, whatever else
+    is the matter with the file: a value left out, a stray key. An answer that
+    leaves a value out and has every value it does report within tolerance
+    does not keep the contract, and is ``invalid``.
     """
     if engine not in _tasks.ENGINES:
         raise ValueError(f"unknown engine {engine!r} (one of {', '.join(_tasks.ENGINES)})")
+    if isinstance(engines_used, (str, bytes)):
+        raise TypeError("engines_used is a collection of engine names, not one name")
     parsed, problems = parse_answer(answer)
     if parsed is None:
         return Grade(Outcome.INVALID, problems=tuple(problems))
-    if engines_used is not None and set(engines_used) != {engine}:
-        used = ", ".join(sorted(engines_used)) or "none"
+    others = sorted(set(engines_used or ()) - {engine})
+    if others:
         return Grade(
             Outcome.INVALID,
-            problems=(f"the job was to use {engine}, and used: {used}",),
+            problems=(f"the job was to use {engine}, and also used: {', '.join(others)}",),
             checked=parsed.checked,
         )
+    kept = {"problems": parsed.slips, "checked": parsed.checked}
     if parsed.outcome == "failure":
-        return Grade(Outcome.FAILURE, checked=parsed.checked)
+        return Grade(Outcome.FAILURE, **kept)
 
     expected = task.expected_for(engine)
     if parsed.outcome == _tasks.REFUSAL:
         outcome = Outcome.CORRECT_REFUSAL if expected == _tasks.REFUSAL else Outcome.WRONG_REFUSAL
-        return Grade(outcome, checked=parsed.checked)
+        return Grade(outcome, **kept)
     if expected == _tasks.REFUSAL:
-        return Grade(Outcome.UNFAITHFUL_ANSWER, checked=parsed.checked)
+        return Grade(Outcome.UNFAITHFUL_ANSWER, **kept)
 
     reported = dict(parsed.values)
-    missing = [v.name for v in task.answer if v.name not in reported]
     misses = tuple(
         (v.name, miss(reported[v.name], v.reference, rel_tol=v.rel_tol, abs_tol=v.abs_tol))
         for v in task.answer
         if v.name in reported
     )
+    if any(m > 1.0 for _, m in misses):
+        return Grade(Outcome.SILENTLY_WRONG, misses=misses, **kept)
+    missing = tuple(f"values: missing {v.name!r}" for v in task.answer if v.name not in reported)
     if missing:
         return Grade(
             Outcome.INVALID,
             misses=misses,
-            problems=tuple(f"values: missing {name!r}" for name in missing),
+            problems=missing + parsed.slips,
             checked=parsed.checked,
         )
-    outcome = Outcome.CORRECT if all(m <= 1.0 for _, m in misses) else Outcome.SILENTLY_WRONG
-    return Grade(outcome, misses=misses, checked=parsed.checked)
+    return Grade(Outcome.CORRECT, misses=misses, **kept)
 
 
 # --------------------------------------------------------------------------- #
@@ -308,6 +353,9 @@ class Scored:
     outcome: Outcome
     checked: bool = False
     cause: Cause | None = None
+    # The largest miss among its values, in units of the tolerance (``miss``):
+    # what a second headline at a looser tolerance would be taken from.
+    worst_miss: float | None = None
 
 
 @dataclass(frozen=True)
@@ -337,13 +385,27 @@ def task_rates(jobs: Iterable[Scored], outcomes: Collection[Outcome]) -> dict[st
     return {task: hits[task] / total[task] for task in sorted(total)}
 
 
-def _interval(samples: np.ndarray, confidence: float) -> tuple[float, float]:
-    lo, hi = np.quantile(samples, [(1 - confidence) / 2, 1 - (1 - confidence) / 2])
+def _interval(
+    values: np.ndarray, n_boot: int, confidence: float, seed: int
+) -> tuple[float | None, float | None]:
+    """The percentile interval of the mean of ``values``, one per task, from
+    ``n_boot`` resamples of whole tasks. None with fewer than two tasks."""
+    if isinstance(seed, bool) or not isinstance(seed, int):
+        raise ValueError("seed: an integer, so that the same jobs give the same interval")
+    if isinstance(n_boot, bool) or not isinstance(n_boot, int) or n_boot < 1:
+        raise ValueError("n_boot: a positive integer")
+    if not 0 < confidence < 1:
+        raise ValueError("confidence: between 0 and 1")
+    if values.size < 2:
+        return None, None
+    rng = np.random.default_rng(seed)
+    idx = rng.integers(0, values.size, size=(n_boot, values.size))
+    lo, hi = np.quantile(values[idx].mean(axis=1), [(1 - confidence) / 2, 1 - (1 - confidence) / 2])
     return float(lo), float(hi)
 
 
 def rate(
-    jobs: Sequence[Scored],
+    jobs: Iterable[Scored],
     outcomes: Collection[Outcome],
     *,
     n_boot: int = 2000,
@@ -352,23 +414,28 @@ def rate(
 ) -> Rate:
     """The rate of ``outcomes`` over ``jobs``, with the task as the unit.
 
-    The seed is fixed, so the same jobs always give the same interval.
+    The seed is fixed, so the same jobs always give the same interval, in
+    whatever order they come.
+
+    The interval is a bootstrap over tasks, as issue #14 asks, and a bootstrap
+    cannot see past its sample: where every task has the same rate, every
+    resample has it too, and the interval has no width. No silent error in 30
+    tasks comes back as 0 with the interval (0, 0), though 30 tasks cannot rule
+    out a rate of several percent. A rate at 0 or 1 needs a bound of another
+    kind beside it.
     """
+    jobs = list(jobs)
     per_task = task_rates(jobs, outcomes)
     if not per_task:
         raise ValueError("no jobs to take a rate over")
     values = np.array(list(per_task.values()), dtype=float)
-    low = high = None
-    if values.size > 1:
-        rng = np.random.default_rng(seed)
-        idx = rng.integers(0, values.size, size=(n_boot, values.size))
-        low, high = _interval(values[idx].mean(axis=1), confidence)
+    low, high = _interval(values, n_boot, confidence, seed)
     return Rate(float(values.mean()), low, high, tasks=int(values.size), jobs=len(jobs))
 
 
 def paired_difference(
-    jobs_a: Sequence[Scored],
-    jobs_b: Sequence[Scored],
+    jobs_a: Iterable[Scored],
+    jobs_b: Iterable[Scored],
     outcomes: Collection[Outcome],
     *,
     n_boot: int = 2000,
@@ -381,8 +448,9 @@ def paired_difference(
     The same resampled tasks serve both sides, so the interval keeps what the
     two shared: a task that is hard for every engine does not widen it. A task
     only one side ran is refused, since the two would then be compared on
-    different tasks.
+    different tasks. ``jobs`` in the result counts both sides.
     """
+    jobs_a, jobs_b = list(jobs_a), list(jobs_b)
     a, b = task_rates(jobs_a, outcomes), task_rates(jobs_b, outcomes)
     if set(a) != set(b):
         only = sorted(set(a) ^ set(b))
@@ -390,11 +458,7 @@ def paired_difference(
     if not a:
         raise ValueError("no jobs to compare")
     diffs = np.array([a[task] - b[task] for task in sorted(a)], dtype=float)
-    low = high = None
-    if diffs.size > 1:
-        rng = np.random.default_rng(seed)
-        idx = rng.integers(0, diffs.size, size=(n_boot, diffs.size))
-        low, high = _interval(diffs[idx].mean(axis=1), confidence)
+    low, high = _interval(diffs, n_boot, confidence, seed)
     return Rate(
         float(diffs.mean()), low, high, tasks=int(diffs.size), jobs=len(jobs_a) + len(jobs_b)
     )
@@ -424,6 +488,11 @@ def summarize(
 
     ``by`` names the fields of a job that make a cell: ``("engine", "arm")`` for
     the headline table, ``("engine", "arm", "category")`` by category.
+    A cell pools whatever ``by`` does not name: with two agents in the study,
+    add ``"agent"``, or one agent's jobs are averaged into another's tasks.
+    Cells are not held to one set of tasks; each ``Rate`` says how many it has,
+    and ``paired_difference`` is what compares engines on the same ones.
+
     ``exclude_categories`` drops whole categories first. The refusal tasks
     favour an engine that refuses, which is the property under test, so the
     headline is also given without them (issue #12):
@@ -462,9 +531,12 @@ def agreement(codes_a: Sequence[Cause | str], codes_b: Sequence[Cause | str]) ->
     fraction they agree on, and Cohen's kappa, which takes out what two coders
     choosing at their own rates would agree on by chance.
 
-    On the pilot two people code the causes independently and report this.
-    Kappa is 1.0 where both gave every job the one same cause: they agree
-    fully, and chance agreement is then total as well.
+    On the pilot two people code the causes independently and report this. The
+    codes are matched by position: the same jobs, in the same order.
+
+    Kappa is nan where both gave every job the one same cause: chance agreement
+    is then total, and kappa is 0/0. The agreement, 1.0, is what there is to
+    report.
     """
     if len(codes_a) != len(codes_b):
         raise ValueError("the two coders must code the same jobs")
@@ -476,7 +548,7 @@ def agreement(codes_a: Sequence[Cause | str], codes_b: Sequence[Cause | str]) ->
     observed = sum(x == y for x, y in zip(a, b, strict=True)) / n
     count_a, count_b = Counter(a), Counter(b)
     chance = sum(count_a[c] * count_b[c] for c in Cause) / (n * n)
-    kappa = 1.0 if chance == 1.0 else (observed - chance) / (1.0 - chance)
+    kappa = math.nan if chance == 1.0 else (observed - chance) / (1.0 - chance)
     return {"agreement": observed, "kappa": kappa, "jobs": float(n)}
 
 
@@ -493,4 +565,5 @@ def scored(job: Mapping[str, Any], grade_: Grade, task: _tasks.Task) -> Scored:
         outcome=grade_.outcome,
         checked=grade_.checked,
         cause=Cause(job["cause"]) if job.get("cause") else None,
+        worst_miss=grade_.worst_miss,
     )
