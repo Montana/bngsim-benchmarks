@@ -80,11 +80,11 @@ def test_a_value_that_is_not_finite_is_outside_any_tolerance(value):
 
 
 def test_a_tolerance_that_allows_nothing_is_refused():
-    with pytest.raises(ValueError, match="tolerance that is positive at its reference"):
+    with pytest.raises(ValueError, match="tolerance that is positive and finite at its reference"):
         scoring.miss(1.0, 1.0)
-    with pytest.raises(ValueError, match="tolerance that is positive at its reference"):
+    with pytest.raises(ValueError, match="tolerance that is positive and finite at its reference"):
         scoring.miss(0.0, 0.0, rel_tol=1e-3)  # relative to a reference of 0
-    with pytest.raises(ValueError, match="tolerance that is positive at its reference"):
+    with pytest.raises(ValueError, match="tolerance that is positive and finite at its reference"):
         scoring.miss(1.0, 1.0, rel_tol=-1e-3, abs_tol=1.0)
     with pytest.raises(ValueError, match="is not finite"):
         scoring.miss(1.0, math.nan, rel_tol=1e-3)
@@ -141,7 +141,6 @@ def test_the_answer_file_of_the_harness_issue_parses():
         ({**GOOD, "outcome": "done"}, "outcome: one of answer, refusal, failure"),
         ({**GOOD, "outcome": ["answer"]}, "outcome: one of answer, refusal, failure"),
         ({"values": {}}, "outcome: one of answer, refusal, failure"),
-        ({**GOOD, "values": [0.04, 17.5]}, "values: an object of name and number"),
     ],
 )
 def test_a_file_that_cannot_be_read_as_an_answer_says_why(doc, message):
@@ -432,9 +431,12 @@ def test_a_refusal_or_a_failure_need_not_give_values(task, refusal_task, values)
     assert g.problems == (() if values is None else ("values: not an object",))
     failure = {"outcome": "failure", "values": values}
     assert scoring.grade(task, "bngsim", failure).outcome is Outcome.FAILURE
-    # An answer has to give them.
+    # An answer has to give them where one was expected; where a refusal was,
+    # any answer is unfaithful, whatever it gives.
     g = scoring.grade(task, "bngsim", {"outcome": "answer", "values": values})
     assert g.outcome is Outcome.INVALID
+    g = scoring.grade(refusal_task, "bngsim", {"outcome": "answer", "values": values})
+    assert g.outcome is Outcome.UNFAITHFUL_ANSWER
 
 
 def test_numbers_beside_a_refusal_or_a_failure_are_not_read(task, refusal_task):
@@ -949,3 +951,171 @@ def test_scoring_imports_without_bngsim_and_grades_what_needs_no_comparison():
         env={**__import__("os").environ, "PYTHONPATH": str(REPO / "src")},
     )
     assert done.stdout.strip() == "ok", done.stderr
+
+
+# --------------------------------------------------------------------------- #
+# Found in a third review
+# --------------------------------------------------------------------------- #
+
+RIGHT = '"values":{"peak_value":0.0412,"peak_time":17.5}'
+WRONG = '"values":{"peak_value":0.5,"peak_time":17.5}'
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        # One of the outcomes given is no outcome; a last-wins reader sees an answer.
+        '{"outcome":null,"outcome":"answer",' + WRONG + "}",
+        '{"outcome":"answer","outcome":"done",' + WRONG + "}",
+        # One of the values given is no object.
+        '{"outcome":"answer","values":[1],' + WRONG + "}",
+        '{"outcome":"answer",' + WRONG + ',"values":null}',
+        '{"outcome":"answer",' + WRONG + ',"values":[]}',
+        # Right, then wrong: the worst of a name's numbers is graded.
+        '{"outcome":"answer","values":{"peak_value":0.0412,"peak_value":0.5,"peak_time":17.5}}',
+        # Three times.
+        '{"outcome":"answer","values":{"peak_value":0.5,"peak_value":0.0412,"peak_value":0.0412,"peak_time":17.5}}',
+        '{"outcome":"answer",' + WRONG + "," + RIGHT + "," + RIGHT + "}",
+    ],
+)
+def test_every_way_a_file_gives_a_wrong_number_twice_is_graded(task, text):
+    g = scoring.grade(task, "bngsim", text)
+    assert g.outcome is Outcome.SILENTLY_WRONG, g
+    assert dict(g.misses)["peak_value"] > 1e4
+
+
+def test_a_key_given_three_times_is_one_slip(task):
+    text = '{"outcome":"answer","values":{"peak_value":0.5,"peak_value":0.0412,"peak_value":0.0412,"peak_time":17.5}}'
+    g = scoring.grade(task, "bngsim", text)
+    assert g.problems.count("values.peak_value: given more than once") == 1
+
+
+def test_two_outcomes_neither_an_answer_are_read_as_a_json_reader_reads_them(task):
+    # The last given, as a JSON reader keeps it.
+    assert scoring.grade(task, "bngsim", '{"outcome":"refusal","outcome":"failure"}').outcome is (
+        Outcome.FAILURE
+    )
+    assert scoring.grade(task, "bngsim", '{"outcome":"failure","outcome":"refusal"}').outcome is (
+        Outcome.WRONG_REFUSAL
+    )
+
+
+def test_parsed_content_cannot_show_a_key_given_twice(task):
+    # The reason to give the grader the file's text: json.loads keeps the last.
+    text = '{"outcome":"answer","values":{"peak_value":0.5,"peak_value":0.0412,"peak_time":17.5}}'
+    assert scoring.grade(task, "bngsim", text).outcome is Outcome.SILENTLY_WRONG
+    assert scoring.grade(task, "bngsim", json.loads(text)).outcome is Outcome.CORRECT
+    assert "Give the grader the file's bytes or text" in scoring.parse_answer.__doc__
+
+
+@pytest.mark.parametrize(
+    "written, number",
+    [
+        ("nan", math.nan),
+        ("-Infinity", -math.inf),
+        ("inf", math.inf),
+        ("1e999", math.inf),
+        (" 5e-1 ", 0.5),
+    ],
+)
+def test_text_is_a_number_where_json_would_write_one(written, number):
+    answer, _ = scoring.parse_answer({"outcome": "answer", "values": {"v": written}})
+    got = dict(answer.values)["v"]
+    assert got == number or (math.isnan(got) and math.isnan(number))
+
+
+@pytest.mark.parametrize("written", ["1_7.5", "١٢", "0x10", " ", "0.5 uM", '["0.5"]'])
+def test_text_python_would_read_and_json_would_not_is_not_a_number(written):
+    value = json.loads(written) if written.startswith("[") else written
+    answer, _ = scoring.parse_answer({"outcome": "answer", "values": {"v": value}})
+    assert answer.values == () and answer.slips == ("values.v: not a number",)
+
+
+def test_numbers_the_harness_parsed_itself_are_numbers():
+    from decimal import Decimal
+
+    for v in (np.float32(0.5), np.int64(3), Decimal("0.5"), (0.5,)):
+        answer, _ = scoring.parse_answer({"outcome": "answer", "values": {"v": v}})
+        assert len(answer.values) == 1, v
+
+
+def test_bytes_in_any_wrapper_and_any_number_of_byte_order_marks_are_read(task):
+    text = "\ufeff\ufeff" + '{"outcome":"answer",' + WRONG + "}"
+    for doc in (text, bytearray(text.encode()), memoryview(text.encode())):
+        assert scoring.grade(task, "bngsim", doc).outcome is Outcome.SILENTLY_WRONG
+
+
+def test_a_long_name_is_cut_between_characters_and_reads_cleanly():
+    answer, _ = scoring.parse_answer({**GOOD, "values": {"v" * 61: "nM"}})
+    assert answer.slips == ("values." + "v" * 60 + "...: not a number",)
+    answer, _ = scoring.parse_answer({**GOOD, "values": {"v" * 60: "nM"}})
+    assert answer.slips == ("values." + "v" * 60 + ": not a number",)
+    answer, _ = scoring.parse_answer({**GOOD, "values": {"\x00" * 30: "nM"}})
+    name = answer.slips[0][len("values.") : -len(": not a number")]
+    assert name.endswith("...") and name[:-3].endswith("\\x00")
+
+
+def test_exactly_twenty_slips_are_listed_without_a_count():
+    doc = {**GOOD, **{f"key{i}": i for i in range(20)}}
+    answer, _ = scoring.parse_answer(doc)
+    assert len(answer.slips) == 20 and not answer.slips[-1].startswith("and ")
+
+
+def test_stray_values_are_counted_past_twenty_and_none_is_dropped_unsaid(task):
+    values = {"peak_value": 0.5, "peak_time": 17.5, **{f"v{i:03}": float(i) for i in range(100)}}
+    doc = {"outcome": "answer", "values": values, **{f"key{i}": i for i in range(100)}}
+    g = scoring.grade(task, "bngsim", doc, engines_used=["bngsim", "roadrunner"])
+    extra = [p for p in g.problems if "not a value the task asks for" in p]
+    assert len(extra) == 20 and extra[0].startswith("values.v000")
+    assert "and 80 more values the task does not ask for" in g.problems
+    assert "and 80 more" in g.problems  # the stray keys
+    assert len(g.problems) == 1 + 21 + 21
+
+
+def test_an_unknown_audit_name_is_refused_before_the_file_is_read(task):
+    with pytest.raises(ValueError, match="'numpy' is not one of"):
+        scoring.grade(task, "bngsim", "{not json", engines_used=["numpy"])
+
+
+def test_slips_are_kept_on_an_answer_without_its_engine(task):
+    g = scoring.grade(
+        task, "bngsim", {**_answer(peak_value=0.0412, peak_time=17.5), "x": 1}, engines_used=[]
+    )
+    assert g.problems == ("the job answered without importing bngsim", "unknown key 'x'")
+
+
+def test_an_answer_where_a_refusal_was_expected_without_its_engine_is_invalid(refusal_task):
+    # Issue #15's audit, read literally: the job did not use its engine.
+    g = scoring.grade(refusal_task, "bngsim", _answer(peak_value=0.5), engines_used=[])
+    assert g.outcome is Outcome.INVALID
+
+
+def test_a_wrong_number_without_its_engine_is_invalid_and_keeps_its_miss(task):
+    g = scoring.grade(task, "bngsim", _answer(peak_value=0.5, peak_time=17.5), engines_used=())
+    assert g.outcome is Outcome.INVALID and g.worst_miss > 1e4
+
+
+def test_a_tolerance_that_is_not_finite_is_refused():
+    with pytest.raises(ValueError, match="positive and finite"):
+        scoring.miss(-1e308, 1e308, rel_tol=0.9, abs_tol=1e308)
+
+
+@pytest.mark.parametrize("by, error", [("engine", TypeError), (("engine", "colour"), ValueError)])
+def test_the_table_refuses_a_cut_it_cannot_make(by, error):
+    with pytest.raises(error):
+        scoring.summarize(_study(), by=by)
+
+
+def test_the_table_takes_its_fields_once_and_sorts_repetitions_as_numbers():
+    study = _study()
+    assert scoring.summarize(study, by=(n for n in ("engine", "arm"))) == scoring.summarize(study)
+    jobs = _jobs("bngsim", {"t1": ["correct"] * 12})
+    keys = [c.key for c in scoring.summarize(jobs, by=("repetition",))]
+    assert keys == [(i,) for i in range(12)]
+
+
+def test_a_resample_count_past_a_million_is_refused():
+    jobs = _jobs("bngsim", {"t1": ["correct"], "t2": ["failure"]})
+    with pytest.raises(ValueError, match="n_boot: at most 1,000,000"):
+        scoring.rate(jobs, scoring.SILENT, n_boot=10**9)
+    assert scoring.rate(jobs, scoring.SILENT, n_boot=10**6).tasks == 2

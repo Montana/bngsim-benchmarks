@@ -103,8 +103,11 @@ def _drop(*path):
         (_set(["answer", 0, "rel_tol"], 0), "answer[0].rel_tol: must be a positive number"),
         (
             _set(["answer", 0, "rel_tol"], "1e-3"),
-            "rel_tol: must be a positive number (YAML reads 1e-3 as text",
+            "rel_tol: must be a positive number (YAML reads 1e-3 as text: write 1.0e-3",
         ),
+        (_set(["answer", 0, "rel_tol"], "-1e-3"), "answer[0].rel_tol: must be a positive number$"),
+        (_set(["answer", 0, "rel_tol"], "0.5e-3"), "answer[0].rel_tol: must be a positive number$"),
+        (_set(["answer", 0, "rel_tol"], "inf"), "answer[0].rel_tol: must be a positive number$"),
         (_set(["answer", 0, "rel_tol"], "small"), "answer[0].rel_tol: must be a positive number$"),
         (
             _set(["answer", 0, "reference"], "4e-2"),
@@ -122,6 +125,13 @@ def _drop(*path):
         ),
         (_set(["answer", 0, "rel_tol"], 1e-17), "below the spacing of doubles there"),
         (_set(["answer", 1, "abs_tol"], 5e-324), "answer[1]: the tolerance at this reference"),
+        (
+            _set(
+                ["answer", 0],
+                {"name": "peak_value", "reference": 1e308, "rel_tol": 0.9, "abs_tol": 1e308},
+            ),
+            "or is not finite, so every value would",
+        ),
         (_set(["model", "problem"], "  "), "model.problem: the id of a problem spec"),
         (
             _set(["answer", 0, "reference"], 1e-323),
@@ -194,7 +204,7 @@ split: public
     d.mkdir(parents=True)
     path = d / "kinetic_proofreading_peak.yaml"
     path.write_text(example)
-    with pytest.raises(tasks.TaskError, match="YAML reads 1e-3 as text: write it with a decimal"):
+    with pytest.raises(tasks.TaskError, match=r"YAML reads 1e-3 as text: write 1\.0e-3"):
         tasks.load(path)
     path.write_text(example.replace("1e-3", "1.0e-3"))
     problems = [p.id for p in specs.load_all(REPO / "problems")]
@@ -227,6 +237,52 @@ def test_a_task_under_another_spelling_of_the_suffix_is_not_skipped(
     path.rename(path.with_suffix(suffix))
     with pytest.raises(tasks.TaskError, match="a task file ends in .yaml"):
         tasks.load_all(tmp_path / "tasks")
+
+
+def test_a_file_named_only_by_its_suffix_is_refused(task_data, write_task, tmp_path):
+    path = write_task(task_data)
+    (path.parent / ".yaml").write_text("")
+    with pytest.raises(tasks.TaskError, match="a task file ends in .yaml"):
+        tasks.load_all(tmp_path / "tasks")
+
+
+def test_a_key_given_twice_in_a_task_is_refused(tmp_path, task_data, write_task):
+    # PyYAML keeps the last: held_out, then public, would load as public.
+    path = write_task(task_data)
+    path.write_text(path.read_text().replace("split: public", "split: held_out\nsplit: public"))
+    with pytest.raises(tasks.TaskError, match="key 'split' given more than once"):
+        tasks.load(path)
+
+
+@pytest.mark.parametrize(
+    "reference, abs_tol, accepted",
+    [
+        (1.0e6, 1.0e-10, False),  # the doubles near 1e6 are 1.2e-10 apart
+        (1.0e6, 2.0e-10, True),
+        (1.0, 1.2e-16, True),  # below 1.0 the doubles are 1.1e-16 apart
+        (1.0, 2.0**-53, True),  # exactly the gap to the next double below
+        (0.0, 1.0e-300, True),  # a reference of 0 takes any absolute tolerance
+        (-1.0e6, 1.0e-10, False),
+    ],
+)
+def test_a_tolerance_has_to_reach_the_next_double(
+    task_data, write_task, reference, abs_tol, accepted
+):
+    task_data["answer"][1] = {"name": "peak_time", "reference": reference, "abs_tol": abs_tol}
+    path = write_task(task_data)
+    if accepted:
+        assert tasks.load(path).value("peak_time").abs_tol == abs_tol
+    else:
+        with pytest.raises(tasks.TaskError, match="below the spacing of doubles"):
+            tasks.load(path)
+
+
+def test_a_relative_tolerance_reaches_the_next_double_at_a_negative_reference(
+    task_data, write_task
+):
+    task_data["answer"][0] = {"name": "peak_value", "reference": -1.0e6, "rel_tol": 1.0e-17}
+    with pytest.raises(tasks.TaskError, match="below the spacing of doubles"):
+        tasks.load(write_task(task_data))
 
 
 def test_other_files_beside_the_tasks_are_left_alone(task_data, write_task, tmp_path):

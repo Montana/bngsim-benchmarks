@@ -152,16 +152,28 @@ def _number(v: Any) -> bool:
         return False
 
 
-def _yaml_hint(v: Any) -> str:
-    """For a number YAML read as text: ``1e-3`` has no decimal point, and issue
-    #13's own example is written that way."""
-    if isinstance(v, str):
-        try:
-            float(v)
-        except ValueError:
-            return ""
-        return f" (YAML reads {v.strip()} as text: write it with a decimal point, as 1.0e-3)"
-    return ""
+_EXPONENT_WITHOUT_POINT = re.compile(r"[+-]?[0-9]+[eE][+-]?[0-9]+")
+
+
+def _yaml_hint(v: Any, *, positive: bool = False) -> str:
+    """For a number YAML read as text because it has an exponent and no decimal
+    point (``1e-3``; issue #13's own example is written that way), and that
+    would pass written with one. Nothing for other text, which a decimal point
+    would not mend."""
+    if not isinstance(v, str) or not _EXPONENT_WITHOUT_POINT.fullmatch(v.strip()):
+        return ""
+    number = float(v)
+    if not math.isfinite(number) or (positive and not 0 < number):
+        return ""
+    mantissa, exponent = v.strip().lower().split("e")
+    return f" (YAML reads {v.strip()} as text: write {mantissa}.0e{exponent})"
+
+
+def _spacing(x: float) -> float:
+    """The narrowest gap between doubles beside ``x``: below a power of two
+    the doubles are closer than above it."""
+    x = abs(x)
+    return math.ulp(0.0) if x == 0 else min(math.ulp(x), x - math.nextafter(x, 0.0))
 
 
 def _validate_answer(answer: Any, errs: list[str]) -> tuple[Value, ...]:
@@ -193,7 +205,8 @@ def _validate_answer(answer: Any, errs: list[str]) -> tuple[Value, ...]:
         for k in ("rel_tol", "abs_tol"):
             if k in entry:
                 if not _number(entry[k]) or entry[k] <= 0:
-                    errs.append(f"{where}.{k}: must be a positive number{_yaml_hint(entry[k])}")
+                    hint = _yaml_hint(entry[k], positive=True)
+                    errs.append(f"{where}.{k}: must be a positive number{hint}")
                 elif k == "rel_tol" and entry[k] >= 1:
                     # Within 100% of the reference, 0 and the wrong sign pass.
                     errs.append(f"{where}.rel_tol: must be below 1")
@@ -204,16 +217,19 @@ def _validate_answer(answer: Any, errs: list[str]) -> tuple[Value, ...]:
         elif (
             _number(reference)
             and len(tols) == ("rel_tol" in entry) + ("abs_tol" in entry)
-            and tols.get("abs_tol", 0.0) + tols.get("rel_tol", 0.0) * abs(reference)
-            < math.ulp(float(reference))
+            and not (
+                _spacing(float(reference))
+                <= tols.get("abs_tol", 0.0) + tols.get("rel_tol", 0.0) * abs(reference)
+                < math.inf
+            )
         ):
             # Relative to a reference of 0, or with a tolerance narrower than
             # the spacing of doubles there, nothing but the reference itself is
             # within tolerance.
             errs.append(
                 f"{where}: the tolerance at this reference is below the spacing of doubles "
-                "there, so only the reference itself would pass (a reference of 0 needs an "
-                "'abs_tol')"
+                "there, so only the reference itself would pass, or is not finite, so every "
+                "value would (a reference of 0 needs an 'abs_tol')"
             )
         if len(errs) == before:
             values.append(Value(name=name, reference=float(reference), **tols))
@@ -358,6 +374,23 @@ def validate(data: Any, path: str | Path) -> Task:
     )
 
 
+class _UniqueKeyLoader(yaml.SafeLoader):
+    """``yaml.safe_load``, refusing a key given twice in one mapping. PyYAML
+    keeps the last, so ``split: held_out`` and then ``split: public`` would
+    load as public, past the check that keeps held-out tasks out."""
+
+    def construct_mapping(self, node, deep=False):
+        seen = set()
+        for key_node, _ in node.value:
+            key = self.construct_object(key_node, deep=deep)
+            if key in seen:
+                raise yaml.constructor.ConstructorError(
+                    None, None, f"key {key!r} given more than once", key_node.start_mark
+                )
+            seen.add(key)
+        return super().construct_mapping(node, deep=deep)
+
+
 def load(path: str | Path) -> Task:
     path = Path(path)
     try:
@@ -365,7 +398,7 @@ def load(path: str | Path) -> Task:
     except (OSError, UnicodeDecodeError) as exc:
         raise TaskError(path, [f"cannot be read as UTF-8 text: {exc}"]) from exc
     try:
-        data = yaml.safe_load(text)
+        data = yaml.load(text, Loader=_UniqueKeyLoader)  # a SafeLoader
     except yaml.YAMLError as exc:
         raise TaskError(path, [f"not valid YAML: {exc}"]) from exc
     return validate(data, path)
@@ -397,7 +430,7 @@ def load_all(
                 tasks.append(load(path))
             except TaskError as exc:
                 errors.append(exc)
-        elif path.suffix.lower() in (".yaml", ".yml"):
+        elif path.suffix.lower() in (".yaml", ".yml") or path.name.lower() in (".yaml", ".yml"):
             # Under another spelling of the suffix a task would be skipped, and
             # with it the check that keeps a held-out task out of the repository.
             errors.append(TaskError(path, ["a task file ends in .yaml"]))

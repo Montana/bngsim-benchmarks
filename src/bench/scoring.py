@@ -23,12 +23,16 @@ here what it means in the correctness jobs.
 
 from __future__ import annotations
 
+import dataclasses
 import json
 import math
+import numbers
 import operator
+import re
 from collections import Counter
 from collections.abc import Collection, Iterable, Mapping, Sequence
 from dataclasses import dataclass, field
+from decimal import Decimal
 from enum import Enum
 from typing import Any
 
@@ -126,8 +130,9 @@ def miss(value: float, reference: float, *, rel_tol: float = 0.0, abs_tol: float
     """
     if not math.isfinite(reference):
         raise ValueError(f"reference {reference!r} is not finite")
-    if rel_tol < 0 or abs_tol < 0 or abs_tol + rel_tol * abs(reference) <= 0:
-        raise ValueError("a value needs a tolerance that is positive at its reference")
+    width = abs_tol + rel_tol * abs(reference)
+    if rel_tol < 0 or abs_tol < 0 or not 0 < width < math.inf:
+        raise ValueError("a value needs a tolerance that is positive and finite at its reference")
     value = float(value)
     if not math.isfinite(value):
         return math.inf
@@ -151,23 +156,45 @@ def within(value: float, reference: float, *, rel_tol: float = 0.0, abs_tol: flo
 _ANSWER_KEYS = {"outcome", "values", "checked", "check", "notes"}
 _ANSWER_OUTCOMES = (_tasks.ANSWER, _tasks.REFUSAL, "failure")
 _SHOWN = 60  # how much of an agent's own text a problem quotes
-_MAX_SLIPS = 20  # how many slips a grade lists before it counts the rest
+_MAX_SLIPS = 20  # how many slips of one kind a grade lists before it counts the rest
 _MAX_DIGITS = 400  # an integer longer than this is read as infinite, unconverted
+# A number as JSON writes it, and the words for the non-finite ones that
+# Python's JSON reader takes: what an agent may put in quotes and mean a number.
+_NUMBER_TEXT = re.compile(
+    r"-?(0|[1-9][0-9]*)(\.[0-9]+)?([eE][+-]?[0-9]+)?|[+-]?(nan|inf|infinity)",
+    re.IGNORECASE | re.ASCII,
+)
+
+
+def _cut(text: Any) -> tuple[str, bool]:
+    """``repr`` of an agent's text, at most ``_SHOWN + 20`` characters, and
+    whether it was cut. Cut between characters, never inside an escape."""
+    text = str(text)
+    chars = text[:_SHOWN]
+    while len(repr(chars)) > _SHOWN + 20:
+        chars = chars[: max(len(chars) // 2, len(chars) - 8)]
+    return repr(chars), len(chars) < len(text)
 
 
 def _shown(text: Any) -> str:
-    """An agent's text, cut short: a problem names the entry, and does not carry
-    whatever the agent put there into the result."""
-    text = str(text)
-    quoted = repr(text[:_SHOWN])
-    cut = len(text) > _SHOWN or len(quoted) > _SHOWN + 20
-    return quoted[: _SHOWN + 20] + ("..." if cut else "")
+    """An agent's text quoted, cut short: a problem names the entry, and does
+    not carry whatever the agent put there into the result."""
+    quoted, cut = _cut(text)
+    return quoted + ("..." if cut else "")
+
+
+def _name(text: Any) -> str:
+    """An agent's name for an entry, as it reads after ``values.``: unquoted,
+    cut short."""
+    quoted, cut = _cut(text)
+    return quoted[1:-1] + ("..." if cut else "")
 
 
 def _as_float(v: Any) -> float | None:
-    """A JSON number as a float, or None for what is not one. An integer too
-    large for a float is infinite, which no tolerance admits."""
-    if isinstance(v, bool) or not isinstance(v, (int, float)):
+    """A number as a float, or None for what is not one: a JSON number, or one
+    the harness parsed itself (numpy, Decimal). An integer too large for a
+    float is infinite, which no tolerance admits."""
+    if isinstance(v, bool) or not isinstance(v, (numbers.Real, Decimal)):
         return None
     try:
         return float(v)
@@ -179,16 +206,15 @@ def _number_written(v: Any) -> tuple[float | None, str]:
     """``(number, slip)`` for one entry of ``values``. A number is itself. A
     number written as text, ``"0.5"``, or alone in a list, ``[0.5]``, is read as
     the number it holds, with a slip: quoted, a wrong number would otherwise
-    read as a value left out. Anything else is not a number."""
+    read as a value left out. Text is read as a number only as JSON would write
+    one (and ``nan``, ``inf``), not as everything Python's ``float`` takes
+    (``1_7.5``, digits of other scripts). Anything else is not a number."""
     number = _as_float(v)
     if number is not None:
         return number, ""
-    if isinstance(v, str):
-        try:
-            return float(v.strip()), "a number written as text"
-        except ValueError:
-            return None, "not a number"
-    if isinstance(v, list) and len(v) == 1 and _as_float(v[0]) is not None:
+    if isinstance(v, str) and _NUMBER_TEXT.fullmatch(v.strip()):
+        return float(v.strip()), "a number written as text"
+    if isinstance(v, (list, tuple)) and len(v) == 1 and _as_float(v[0]) is not None:
         return _as_float(v[0]), "a number written as a list"
     return None, "not a number"
 
@@ -210,12 +236,22 @@ def _object(pairs: list[tuple[str, Any]]) -> _Object:
     return obj
 
 
+def _repeated(obj: Any) -> tuple[tuple[str, Any], ...]:
+    return obj.repeated if isinstance(obj, _Object) else ()
+
+
 def _parse_int(digits: str) -> int | float:
     # Python refuses to convert an integer of more than 4300 digits, and the
     # file is valid JSON all the same. No tolerance admits a number that long.
     if len(digits) > _MAX_DIGITS:
         return -math.inf if digits.startswith("-") else math.inf
     return int(digits)
+
+
+def _capped(slips: list[str], what: str = "") -> list[str]:
+    if len(slips) <= _MAX_SLIPS:
+        return slips
+    return slips[:_MAX_SLIPS] + [f"and {len(slips) - _MAX_SLIPS} more{what}"]
 
 
 @dataclass(frozen=True)
@@ -237,21 +273,30 @@ def parse_answer(doc: Any) -> tuple[Answer | None, list[str]]:
     """``(answer, problems)`` from the bytes, the text or the parsed content of
     ``answer.json``.
 
-    ``answer`` is None only where the file cannot be read as an answer at all:
-    there is none, it does not parse, it is not an object, it names no outcome,
-    or it says ``answer`` and its values are not an object. Those are
-    ``invalid``. Anything less is read, and kept in ``Answer.slips``: an unknown
-    key, a ``checked`` that is not true or false, a value that is not a number,
-    a key given twice. A slip must not move a job out of the headline: a file
-    with a wrong number in it and a stray key reported a wrong number.
+    Give the grader the file's bytes or text. A key given twice can be seen
+    only there: JSON parsers keep the last, so in parsed content a file that
+    gave a wrong number and then a right one shows only the right one. Text
+    also carries integers too long for Python to convert, and nesting too deep
+    for it to parse, to a verdict.
 
-    A key given twice is read both ways. JSON parsers keep the last, so a file
-    could show a wrong number first and a right one after; every number given
-    for a name is graded, and an ``outcome`` of ``answer`` given anywhere
-    stands.
+    ``answer`` is None only where the file cannot be read as an answer at all:
+    there is none, it does not parse, it is not an object, or no ``outcome`` in
+    it is one of ``answer``, ``refusal``, ``failure``. Those are ``invalid``.
+    Anything less is read, and kept in ``Answer.slips``: an unknown key, a
+    ``checked`` that is not true or false, a value that is not a number, a key
+    given twice, a ``values`` that is not an object. A slip must not move a job
+    out of the headline: a file with a wrong number in it and a stray key
+    reported a wrong number.
+
+    A key given twice is read every way it is given. Every number given for a
+    name is graded. An ``outcome`` of ``answer`` given anywhere stands, since it
+    reports numbers; otherwise the last one given does, as a JSON reader takes
+    it.
     """
     if doc is None:
         return None, ["no answer file"]
+    if isinstance(doc, (bytearray, memoryview)):
+        doc = bytes(doc)
     if isinstance(doc, bytes):
         try:
             doc = doc.decode(json.detect_encoding(doc))
@@ -259,44 +304,41 @@ def parse_answer(doc: Any) -> tuple[Answer | None, list[str]]:
             return None, [f"not valid JSON: {exc}"]
     if isinstance(doc, str):
         try:
-            doc = json.loads(
-                doc.removeprefix("\ufeff"), object_pairs_hook=_object, parse_int=_parse_int
-            )
+            doc = json.loads(doc.lstrip("\ufeff"), object_pairs_hook=_object, parse_int=_parse_int)
         except (ValueError, RecursionError) as exc:
             reason = "nested too deeply" if isinstance(exc, RecursionError) else str(exc)
             return None, [f"not valid JSON: {reason}"]
     if not isinstance(doc, dict):
         return None, ["the answer must be a JSON object"]
-    repeated = list(getattr(doc, "repeated", ()))
-    slips = [
-        f"{_shown(k)[1:-1]}: given more than once" for k in dict.fromkeys(k for k, _ in repeated)
-    ]
+    repeated = _repeated(doc)
+    slips = [f"{_name(k)}: given more than once" for k in dict.fromkeys(k for k, _ in repeated)]
 
-    outcomes = [doc.get("outcome")] + [v for k, v in repeated if k == "outcome"]
-    if not all(isinstance(o, str) and o in _ANSWER_OUTCOMES for o in outcomes):
+    given = [v for k, v in repeated if k == "outcome"] + [doc.get("outcome")]
+    outcomes = [o for o in given if isinstance(o, str) and o in _ANSWER_OUTCOMES]
+    if not outcomes:
         return None, [f"outcome: one of {', '.join(_ANSWER_OUTCOMES)}"]
-    # Given twice and not alike, the one that reports numbers stands.
-    outcome = _tasks.ANSWER if _tasks.ANSWER in outcomes else outcomes[0]
+    if len(outcomes) < len(given):
+        slips.append(f"outcome: one given is not one of {', '.join(_ANSWER_OUTCOMES)}")
+    outcome = _tasks.ANSWER if _tasks.ANSWER in outcomes else outcomes[-1]
 
     slips += [f"unknown key {_shown(k)}" for k in doc if k not in _ANSWER_KEYS]
     pairs: list[tuple[str, float]] = []
-    for values in [doc.get("values", {})] + [v for k, v in repeated if k == "values"]:
-        if not isinstance(values, dict):
-            if outcome == _tasks.ANSWER:
-                return None, ["values: an object of name and number"]
-            # A refusal or a failure reports no values, and null says so.
-            if values is not None:
-                slips.append("values: not an object")
+    value_slips: list[str] = []
+    for values in [v for k, v in repeated if k == "values"] + [doc.get("values")]:
+        if values is None:
             continue
-        for name, v in list(values.items()) + list(getattr(values, "repeated", ())):
+        if not isinstance(values, dict):
+            slips.append("values: not an object")
+            continue
+        for name, v in list(_repeated(values)) + list(values.items()):
             number, slip = _number_written(v)
             if slip:
-                slips.append(f"values.{_shown(name)[1:-1]}: {slip}")
+                value_slips.append(f"values.{_name(name)}: {slip}")
             if number is not None:
                 pairs.append((str(name), number))
-        slips += [
-            f"values.{_shown(k)[1:-1]}: given more than once"
-            for k in dict.fromkeys(k for k, _ in getattr(values, "repeated", ()))
+        value_slips += [
+            f"values.{_name(k)}: given more than once"
+            for k in dict.fromkeys(k for k, _ in _repeated(values))
         ]
     checked = doc.get("checked", False)
     if not isinstance(checked, bool):
@@ -310,8 +352,6 @@ def parse_answer(doc: Any) -> tuple[Answer | None, list[str]]:
         elif not isinstance(text[k], str):
             slips.append(f"{k}: not text")
             text[k] = ""
-    if len(slips) > _MAX_SLIPS:
-        slips = slips[:_MAX_SLIPS] + [f"and {len(slips) - _MAX_SLIPS} more"]
     return (
         Answer(
             outcome=outcome,
@@ -319,7 +359,7 @@ def parse_answer(doc: Any) -> tuple[Answer | None, list[str]]:
             checked=checked,
             check=text["check"],
             notes=text["notes"],
-            slips=tuple(slips),
+            slips=tuple(_capped(slips) + _capped(value_slips, " about values")),
         ),
         [],
     )
@@ -390,15 +430,23 @@ def grade(
     file gives for a value the task asks for, outside its tolerance, makes the
     job ``silently_wrong``: whatever else is the matter with the file, another
     value left out, a stray key, the number in quotes, the name given twice
-    with a right number after. An answer that leaves a value out and has every
-    number it does give within tolerance does not keep the contract, and is
-    ``invalid``. So is one whose number cannot be read as one at all, an object
-    or a word, or sits under another name than the task's.
+    with a right number after. A wrong number is ``invalid`` in these cases
+    only: the import audit says the job used another engine, or answered
+    without importing its own (issue #15); the file cannot be read as an answer
+    at all; or the number cannot be read as one (an object, a word, a number
+    with its unit) or sits under another name than the task's, while every
+    number that can be read is right. In the last case the job left a value
+    out, and an answer that does is ``invalid``.
+
+    Where an answer was expected and the agent answered without reporting the
+    values, the job is ``invalid``; where a refusal was expected, an answer is
+    ``unfaithful_answer`` whatever its values are.
 
     A refusal or a failure is graded as that; numbers beside it are not read.
     """
     if engine not in _tasks.ENGINES:
         raise ValueError(f"unknown engine {engine!r} (one of {', '.join(_tasks.ENGINES)})")
+    # Checked first: a bad audit is the harness's mistake, whatever the file says.
     used = _audit(engines_used)
     parsed, problems = parse_answer(answer)
     if parsed is None:
@@ -419,8 +467,8 @@ def grade(
         misses = tuple((v.name, worst[v.name]) for v in task.answer if v.name in worst)
         missing = tuple(f"values: missing {v.name!r}" for v in task.answer if v.name not in worst)
         others = sorted({name for name, _ in parsed.values if name not in asked})
-        extra = tuple(f"values.{_shown(n)[1:-1]}: not a value the task asks for" for n in others)
-        slips = (missing + slips + extra[:_MAX_SLIPS])[: 2 * _MAX_SLIPS + len(missing)]
+        extra = [f"values.{_name(n)}: not a value the task asks for" for n in others]
+        slips = missing + slips + tuple(_capped(extra, " values the task does not ask for"))
     kept = {"misses": misses, "checked": parsed.checked}
 
     if used is not None and used - {engine}:
@@ -494,6 +542,9 @@ def task_rates(jobs: Iterable[Scored], outcomes: Collection[Outcome]) -> dict[st
     return {task: hits[task] / total[task] for task in sorted(total)}
 
 
+_MAX_BOOT = 1_000_000
+
+
 def _whole(value: Any, name: str, least: int) -> int:
     """``value`` as an integer of at least ``least`` (a numpy integer is one; a
     bool, a float and None are not)."""
@@ -524,6 +575,8 @@ def _interval(
     """The percentile interval of the mean of ``values``, one per task, from
     ``n_boot`` resamples of whole tasks. None with fewer than two tasks."""
     seed, n_boot = _whole(seed, "seed", 0), _whole(n_boot, "n_boot", 1)
+    if n_boot > _MAX_BOOT:
+        raise ValueError(f"n_boot: at most {_MAX_BOOT:,}, which is more than an interval needs")
     if isinstance(confidence, bool) or not isinstance(confidence, (int, float)):
         raise ValueError("confidence: between 0 and 1")
     if not 0 < confidence < 1:
@@ -602,7 +655,7 @@ class Cell:
     """One row of the outcome table: the jobs of one engine and arm (or of
     whatever ``by`` names), their two rates, and every outcome's count."""
 
-    key: tuple[str, ...]
+    key: tuple[Any, ...]
     silently_wrong: Rate
     completion: Rate
     counts: dict[str, int] = field(default_factory=dict)
@@ -631,6 +684,13 @@ def summarize(
     headline is also given without them (issue #12):
     ``exclude_categories=("should_refuse",)``.
     """
+    if isinstance(by, (str, bytes)):
+        raise TypeError("by: a sequence of field names, not one name")
+    by = tuple(by)
+    fields = {f.name for f in dataclasses.fields(Scored)}
+    unknown = [name for name in by if name not in fields]
+    if unknown:
+        raise ValueError(f"by: {', '.join(map(repr, unknown))} is not a field of a job")
     if isinstance(exclude_categories, (str, bytes)):
         raise TypeError("exclude_categories: a collection of categories, not one name")
     exclude_categories = set(exclude_categories)
@@ -638,7 +698,8 @@ def summarize(
     for job in jobs:
         if job.category in exclude_categories:
             continue
-        cells.setdefault(tuple(str(getattr(job, name)) for name in by), []).append(job)
+        # The values themselves, so that repetitions sort as numbers.
+        cells.setdefault(tuple(getattr(job, name) for name in by), []).append(job)
     kw = {"n_boot": n_boot, "confidence": confidence, "seed": seed}
     return [
         Cell(
