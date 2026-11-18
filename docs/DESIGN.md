@@ -292,7 +292,13 @@ Correctness jobs and timing jobs are separate:
 - **Correctness jobs** can run anywhere, at any parallelism.
 - **Timing jobs** follow the protocol of section 7.
 
-A timing job runs only on problems whose correctness job passed.
+A timing job runs on problems whose correctness job passed, and on problems it
+marked REFERENCE_FAILED -- BNGsim ran and was anchored by the surviving
+references, so there is still a comparison worth timing. The timing job then
+gives each reference a trial run and drops any that crash (recording a
+`<name>_error`, exactly as correctness does), timing BNGsim against the engines
+that survive. Any other correctness outcome (DIFF, EXCEPTION, BAD_TEST, …) blocks
+the timing job.
 
 ## 6. Results
 

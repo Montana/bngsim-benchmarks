@@ -1,18 +1,20 @@
 """ODE simulation of BNGL models: BNGsim against a registry of reference engines.
 
 BNGsim is the system under test; it is compared, on one problem, against every
-reference ODE engine in ``REFERENCE_ENGINES``. Seeded now with:
+reference ODE engine in ``REFERENCE_ENGINES``:
 
 - **run_network** -- BioNetGen's CVODE binary, the trusted dense oracle, run as a
   fresh subprocess the way BNG2.pl runs it (reads the ``.net``).
 - **roadrunner** -- libRoadRunner's CVODE, an in-process library that reads SBML
   exported from the same ``.net``, so its verdict also validates the export.
+- **copasi** -- COPASI's LSODA (the ``deterministic`` method), an in-process
+  library driven through BASICO, reading the same exported SBML.
+- **amici** -- AMICI's CVODES, which compiles the exported SBML to a C++/SWIG
+  extension once and then integrates the forward problem.
 
 Further SBML-reading references drop in the same way, with the same
-warm/run/config contract; nothing else changes when one is added. ``CopasiODE``
-and ``AmiciODE`` below are adapters ready to join: they are defined here but held
-out of ``REFERENCE_ENGINES`` until the cross-platform timing leg finishes, because
-adding one re-ids every ODE job (``engines_id``) and re-runs the corpus.
+warm/run/config contract; nothing else changes when one is added. Adding one
+re-ids every ODE job (``engines_id``) and re-runs the corpus.
 
 Pipeline, per problem:
 
@@ -31,6 +33,12 @@ BNGsim agrees with every one -- a genuine cross-engine check. The timing job
 interleaves all the engines round-robin in one drift-cancelling run (``bench.timing``)
 and reports each engine's absolute time with a bootstrap CI; a speedup is only a
 derived view (``gather``), never a stored headline.
+
+A reference engine that crashes is a result to attribute, not a bug to patch: the
+correctness job records it as ``REFERENCE_FAILED`` with a ``<name>_error`` and
+still scores BNGsim against the references that ran, and the timing job gives each
+reference a trial run, records any crash the same way, and drops it from the timed
+set -- BNGsim and the surviving references are still timed.
 
 **Column alignment** is the one real correctness risk, and it is self-checking:
 run_network reads the same ``.net`` as BNGsim, so its columns share that order by
@@ -74,7 +82,10 @@ CAPABILITY = "ode"
 # 4: BNGsim is compared against a registry of reference engines (run_network and
 #    libRoadRunner), not run_network alone; timing interleaves all engines
 #    round-robin and reports each engine's absolute time.
-HARNESS_VERSION = "4"
+# 5: the registry carries COPASI and AMICI as well; the timing job gives each
+#    reference a trial run and drops any that crash (recording a <name>_error),
+#    so one crashing reference no longer loses BNGsim and the survivors' timings.
+HARNESS_VERSION = "5"
 
 TIMING_PROTOCOL = {"warmup_rounds": 1, "min_rounds": 5, "max_rounds": 20, "budget_seconds": 120.0}
 
@@ -131,10 +142,15 @@ def jobs(problem: Problem) -> list[Job]:
         "source_sha256": problem.source["sha256"],
         "protocol": proto,
         "setting": {"solver": "auto", "codegen": "auto"},
-        # The libRoadRunner version keys only this capability's freshness, not the
-        # global per-kind fingerprint: a roadrunner change restales ode results,
-        # never a future capability that does not use it (see env.fingerprint).
-        "reference_versions": {"roadrunner": env.roadrunner_identity().get("version")},
+        # The reference-engine versions key only this capability's freshness, not
+        # the global per-kind fingerprint: a roadrunner/copasi/amici change restales
+        # ode results, never a future capability that does not use it (see
+        # env.fingerprint). run_network's version rides the global fingerprint.
+        "reference_versions": {
+            "roadrunner": env.roadrunner_identity().get("version"),
+            "copasi": env.copasi_identity().get("version"),
+            "amici": env.amici_identity().get("version"),
+        },
     }
     species = problem.size.get("species", 100)
     correctness = Job(
@@ -620,10 +636,12 @@ class AmiciODE:
 
 
 # The reference engines BNGsim is compared against, in a fixed order. run_network
-# builds from the ``.net``; roadrunner (and, later, amici/copasi) from the SBML.
+# builds from the ``.net``; roadrunner, copasi and amici from the SBML.
 REFERENCE_ENGINES: dict[str, type] = {
     RunNetworkODE.NAME: RunNetworkODE,
     RoadRunnerODE.NAME: RoadRunnerODE,
+    CopasiODE.NAME: CopasiODE,
+    AmiciODE.NAME: AmiciODE,
 }
 
 
@@ -634,6 +652,18 @@ def _build_reference(name: str, prep: dict[str, Any], *, sparse: bool,
     if cls.INPUT == "net":
         return cls(prep["net"], prep["proto"], out_prefix, sparse=sparse, timeout=timeout)
     return cls(prep["sbml"], prep["species_names"], prep["name_to_id"], prep["proto"])
+
+
+def _engine_role(name: str) -> str:
+    """How an engine is timed, for the human-readable timing record. Derived from
+    the engine name so it never drifts from the registry: run_network is a fresh
+    subprocess per run; every other reference (and BNGsim) is an in-process library
+    timed warm."""
+    if name == "bngsim":
+        return "warm, in-process (system under test)"
+    if name == "run_network":
+        return "fresh subprocess"
+    return "warm, in-process"
 
 
 # --------------------------------------------------------------------------- #
@@ -841,26 +871,44 @@ def run_timing(job: Job, problem: Problem, ctx: dict[str, Any]) -> dict[str, Any
     info["bngsim"] = bngsim_engine.config(first)
     bngsim_cold = BngsimODE.trajectory(first)
 
-    # Build each reference. run_network is timed as the authors ran it only if that
-    # run is right: time sparse only where it agrees with the dense run.
+    # Build each reference and give it one trial run, isolating any that fail. A
+    # reference can crash inside run() rather than __init__ (COPASI drops a constant
+    # source species and then raises on the missing column; AMICI can fail at
+    # integration), and the interleave's warm-up round is not fault-isolated -- so a
+    # trial run here is what keeps one crasher from taking down the whole timing job.
+    # A failed reference is recorded (as <name>_error) and dropped from the timed
+    # set, exactly as the correctness job records REFERENCE_FAILED; BNGsim and the
+    # surviving references are still timed. The trial result is discarded (the real
+    # timing is the interleave below), at the cost of one extra cold run per engine.
+    # BNGsim is never dropped -- it ran cold above, and a BNGsim failure there is an
+    # EXCEPTION the worker records, not an engine we quietly skip.
+    #
+    # run_network is timed as the authors ran it only if that run is right: time
+    # sparse only where it agrees with the dense run. Its dense run and sparse check
+    # are themselves the trial, so no extra warm() is needed for it.
     references: dict[str, Any] = {}
     engines: dict[str, Any] = {"bngsim": bngsim_engine}
+    ref_errors: dict[str, str] = {}
     for name in REFERENCE_ENGINES:
-        if name == "run_network":
-            dense_engine = RunNetworkODE(prep["net"], proto, workdir / "rn_dense",
-                                         sparse=False, timeout=timeout)
-            dense = RunNetworkODE.trajectory(dense_engine.run())
-            check = sparse_check(prep["net"], proto, workdir, dense, timeout)
-            use_sparse = bool(check and check["agrees_with_dense"])
-            if check is not None:
-                info["sparse_reference"] = check
-            engine = RunNetworkODE(prep["net"], proto, workdir / "rn", sparse=use_sparse,
-                                   timeout=timeout)
-        else:
-            engine = _build_reference(name, prep, sparse=False, out_prefix=workdir / name,
-                                      timeout=timeout)
-        engines[name] = engine
-        references[name] = engine.config()
+        try:
+            if name == "run_network":
+                dense_engine = RunNetworkODE(prep["net"], proto, workdir / "rn_dense",
+                                             sparse=False, timeout=timeout)
+                dense = RunNetworkODE.trajectory(dense_engine.run())
+                check = sparse_check(prep["net"], proto, workdir, dense, timeout)
+                use_sparse = bool(check and check["agrees_with_dense"])
+                if check is not None:
+                    info["sparse_reference"] = check
+                engine = RunNetworkODE(prep["net"], proto, workdir / "rn", sparse=use_sparse,
+                                       timeout=timeout)
+            else:
+                engine = _build_reference(name, prep, sparse=False, out_prefix=workdir / name,
+                                          timeout=timeout)
+                engine.warm()  # trial run: COPASI/AMICI surface failures here, not in __init__
+            engines[name] = engine
+            references[name] = engine.config()
+        except Exception as exc:  # noqa: BLE001
+            ref_errors[name] = f"{type(exc).__name__}: {exc}"[:400]
     info["references"] = references
 
     # Interleave every engine round-robin in one drift-cancelling run. The timed
@@ -876,7 +924,9 @@ def run_timing(job: Job, problem: Problem, ctx: dict[str, Any]) -> dict[str, Any
     # differs from dense but is still reproducible).
     outputs = {name: reps["engines"][name].pop("outputs") for name in runs}
     repro: dict[str, Any] = {"bngsim": _reproducibility(bngsim_cold, outputs["bngsim"], REPRO_TOL)}
-    for name in REFERENCE_ENGINES:
+    for name in engines:  # the surviving references; a dropped one is not in `engines`
+        if name == "bngsim":
+            continue
         outs = outputs[name]
         repro[name] = _reproducibility(outs[0], outs[1:], REPRO_TOL) if outs else \
             {"passed": True, "n_reps": 0, "max_err_over_peak": 0.0, "worst_rep": None,
@@ -885,17 +935,22 @@ def run_timing(job: Job, problem: Problem, ctx: dict[str, Any]) -> dict[str, Any
 
     seconds_by_engine = {name: reps["engines"][name]["seconds"] for name in runs}
     times = absolute_time_stats(seconds_by_engine)
-    return {
+    rec: dict[str, Any] = {
+        # A dropped reference does not fail the row: it is recorded, not scored
+        # (parity_core.taxonomy). The outcome rests only on whether BNGsim and the
+        # surviving references each reproduced their first run.
         "outcome": "PASS" if reproducible else "NOT_REPRODUCIBLE",
         "measurements": {
             **info,
-            "engine_roles": {"bngsim": "warm, in-process (system under test)",
-                             "run_network": "fresh subprocess", "roadrunner": "warm, in-process"},
+            "engine_roles": {name: _engine_role(name) for name in engines},
             "repetitions": reps,
             "reproducibility": repro,
             "times": times,
         },
     }
+    for name, err in ref_errors.items():
+        rec[f"{name}_error"] = err
+    return rec
 
 
 def run(job: Job, problem: Problem, ctx: dict[str, Any]) -> dict[str, Any]:

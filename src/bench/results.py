@@ -20,6 +20,14 @@ from .jobs import CORRECTNESS, TIMING, Job, digest
 
 SCHEMA = 1
 
+# A dependent job (timing) runs when its requirement (correctness) reached one of
+# these outcomes. PASS is a clean cross-engine agreement; REFERENCE_FAILED means
+# BNGsim ran and was anchored by the surviving references while another reference
+# crashed -- that failure is recorded, not scored (parity_core.taxonomy), and
+# there is still a BNGsim-and-survivors comparison worth timing. Any other outcome
+# (DIFF/EXCEPTION/BAD_TEST/...) blocks the dependent job.
+_REQUIREMENT_SATISFIED = frozenset({"PASS", "REFERENCE_FAILED"})
+
 
 def result_path(results_dir: str | Path, job: Job | str) -> Path:
     jid = job.id if isinstance(job, Job) else job
@@ -104,7 +112,7 @@ def status(
         )
         if not req_fresh:
             return Status(job, "waiting", f"needs a current {req.kind} result")
-        if req_rec.get("outcome") != "PASS":
+        if req_rec.get("outcome") not in _REQUIREMENT_SATISFIED:
             return Status(job, "blocked", f"its {req.kind} job is {req_rec.get('outcome')}")
     if rec is None:
         return Status(job, "missing")

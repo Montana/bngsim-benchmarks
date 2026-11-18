@@ -166,6 +166,17 @@ def test_timing_blocked_when_correctness_did_not_pass(tmp_path, pair):
     assert st.state == "blocked" and "DIFF" in st.reason
 
 
+def test_timing_not_blocked_when_a_reference_failed(tmp_path, pair):
+    # A reference engine crashing is recorded, not scored: BNGsim still ran and was
+    # anchored by the surviving references, so there is a comparison worth timing.
+    # The gate lets REFERENCE_FAILED through (unlike DIFF/EXCEPTION/BAD_TEST); with
+    # no timing result yet, the timing job is merely missing, not blocked.
+    c, t = pair
+    by_id = {c.id: c, t.id: t}
+    put(tmp_path, c, fp(), outcome="REFERENCE_FAILED")
+    assert results.status(t, tmp_path, fp(), by_id).state == "missing"
+
+
 def test_moving_to_another_node_type_stales_timing_not_correctness(tmp_path, pair):
     c, t = pair
     by_id = {c.id: c, t.id: t}
