@@ -152,6 +152,18 @@ def _number(v: Any) -> bool:
         return False
 
 
+def _yaml_hint(v: Any) -> str:
+    """For a number YAML read as text: ``1e-3`` has no decimal point, and issue
+    #13's own example is written that way."""
+    if isinstance(v, str):
+        try:
+            float(v)
+        except ValueError:
+            return ""
+        return f" (YAML reads {v.strip()} as text: write it with a decimal point, as 1.0e-3)"
+    return ""
+
+
 def _validate_answer(answer: Any, errs: list[str]) -> tuple[Value, ...]:
     if not isinstance(answer, list):
         errs.append("answer: a list of values, each with a name, a reference and a tolerance")
@@ -176,16 +188,12 @@ def _validate_answer(answer: Any, errs: list[str]) -> tuple[Value, ...]:
             seen.add(name)
         reference = entry.get("reference")
         if not _number(reference):
-            errs.append(f"{where}.reference: must be a finite number")
+            errs.append(f"{where}.reference: must be a finite number{_yaml_hint(reference)}")
         tols = {}
         for k in ("rel_tol", "abs_tol"):
             if k in entry:
                 if not _number(entry[k]) or entry[k] <= 0:
-                    hint = ""
-                    if isinstance(entry[k], str):
-                        # Issue #13's own example has `rel_tol: 1e-3`.
-                        hint = " (YAML reads 1e-3 as text: write 1.0e-3)"
-                    errs.append(f"{where}.{k}: must be a positive number{hint}")
+                    errs.append(f"{where}.{k}: must be a positive number{_yaml_hint(entry[k])}")
                 elif k == "rel_tol" and entry[k] >= 1:
                     # Within 100% of the reference, 0 and the wrong sign pass.
                     errs.append(f"{where}.rel_tol: must be below 1")
@@ -196,11 +204,17 @@ def _validate_answer(answer: Any, errs: list[str]) -> tuple[Value, ...]:
         elif (
             _number(reference)
             and len(tols) == ("rel_tol" in entry) + ("abs_tol" in entry)
-            and tols.get("abs_tol", 0.0) + tols.get("rel_tol", 0.0) * abs(reference) <= 0
+            and tols.get("abs_tol", 0.0) + tols.get("rel_tol", 0.0) * abs(reference)
+            < math.ulp(float(reference))
         ):
-            # Relative to a reference of 0, or one so small the product is 0,
-            # nothing but the reference itself is within tolerance.
-            errs.append(f"{where}: a tolerance that is 0 at this reference needs an 'abs_tol'")
+            # Relative to a reference of 0, or with a tolerance narrower than
+            # the spacing of doubles there, nothing but the reference itself is
+            # within tolerance.
+            errs.append(
+                f"{where}: the tolerance at this reference is below the spacing of doubles "
+                "there, so only the reference itself would pass (a reference of 0 needs an "
+                "'abs_tol')"
+            )
         if len(errs) == before:
             values.append(Value(name=name, reference=float(reference), **tols))
     return tuple(values)
@@ -264,7 +278,7 @@ def validate(data: Any, path: str | Path) -> Task:
     if "model" in data:
         if not isinstance(model, dict) or set(model) != {"problem"}:
             errs.append("model: a mapping with one key, 'problem', the id of a problem spec")
-        elif not isinstance(model["problem"], str) or not model["problem"]:
+        elif not isinstance(model["problem"], str) or not model["problem"].strip():
             errs.append("model.problem: the id of a problem spec")
         else:
             problem = model["problem"]
@@ -375,15 +389,18 @@ def load_all(
     root = Path(root)
     tasks: list[Task] = []
     errors: list[TaskError] = []
-    for path in sorted(root.rglob("*.yaml")):
-        try:
-            tasks.append(load(path))
-        except TaskError as exc:
-            errors.append(exc)
-    # A task under another suffix would be skipped, and with it the check that
-    # keeps a held-out task out of the repository.
-    for path in sorted(root.rglob("*.yml")):
-        errors.append(TaskError(path, ["a task file ends in .yaml"]))
+    if not root.is_dir():
+        raise TaskError(root, ["no such directory of tasks"])
+    for path in sorted(root.rglob("*")):
+        if path.suffix == ".yaml":
+            try:
+                tasks.append(load(path))
+            except TaskError as exc:
+                errors.append(exc)
+        elif path.suffix.lower() in (".yaml", ".yml"):
+            # Under another spelling of the suffix a task would be skipped, and
+            # with it the check that keeps a held-out task out of the repository.
+            errors.append(TaskError(path, ["a task file ends in .yaml"]))
     if errors:
         raise TaskError(root, [str(e) for e in errors])
     seen: dict[str, str] = {}

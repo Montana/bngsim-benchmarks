@@ -101,11 +101,32 @@ def _drop(*path):
         (_set(["answer", 0, "reference"], float("nan")), "answer[0].reference: must be a finite"),
         (_set(["answer", 0, "reference"], True), "answer[0].reference: must be a finite"),
         (_set(["answer", 0, "rel_tol"], 0), "answer[0].rel_tol: must be a positive number"),
-        (_set(["answer", 0, "rel_tol"], "1e-3"), "YAML reads 1e-3 as text: write 1.0e-3"),
+        (
+            _set(["answer", 0, "rel_tol"], "1e-3"),
+            "rel_tol: must be a positive number (YAML reads 1e-3 as text",
+        ),
+        (_set(["answer", 0, "rel_tol"], "small"), "answer[0].rel_tol: must be a positive number$"),
+        (
+            _set(["answer", 0, "reference"], "4e-2"),
+            "reference: must be a finite number (YAML reads 4e-2",
+        ),
+        (
+            _set(["answer", 0, "reference"], "about 0.04"),
+            "answer[0].reference: must be a finite number$",
+        ),
         (_set(["answer", 1, "abs_tol"], -0.5), "answer[1].abs_tol: must be a positive number"),
         (_drop("answer", 0, "rel_tol"), "answer[0]: needs 'rel_tol', 'abs_tol' or both"),
-        (_set(["answer", 0, "reference"], 0), "answer[0]: a tolerance that is 0 at this reference"),
-        (_set(["answer", 0, "reference"], 1e-323), "answer[0]: a tolerance that is 0 at this ref"),
+        (
+            _set(["answer", 0, "reference"], 0),
+            "answer[0]: the tolerance at this reference is below",
+        ),
+        (_set(["answer", 0, "rel_tol"], 1e-17), "below the spacing of doubles there"),
+        (_set(["answer", 1, "abs_tol"], 5e-324), "answer[1]: the tolerance at this reference"),
+        (_set(["model", "problem"], "  "), "model.problem: the id of a problem spec"),
+        (
+            _set(["answer", 0, "reference"], 1e-323),
+            "answer[0]: the tolerance at this reference is below",
+        ),
         (_set(["answer", 0, "reference"], 10**400), "answer[0].reference: must be a finite"),
         (_set(["answer", 0, "rel_tol"], 10**400), "answer[0].rel_tol: must be a positive number"),
         (_set(["answer", 0, "rel_tol"], 1), "answer[0].rel_tol: must be below 1"),
@@ -129,8 +150,12 @@ def _drop(*path):
 def test_invalid_field_is_refused_with_its_name(task_data, write_task, mutate, message):
     mutate(task_data)
     path = write_task(task_data, name="toy_peak", category="timecourse")
-    with pytest.raises(tasks.TaskError, match=message.replace("(", r"\(").replace("[", r"\[")):
+    pattern = message.replace("(", r"\(").replace("[", r"\[")
+    with pytest.raises(tasks.TaskError) as err:
         tasks.load(path)
+    import re
+
+    assert any(re.search(pattern, problem) for problem in err.value.problems), err.value.problems
 
 
 def test_a_should_refuse_task_expects_a_refusal_from_some_engine(task_data, write_task):
@@ -169,7 +194,7 @@ split: public
     d.mkdir(parents=True)
     path = d / "kinetic_proofreading_peak.yaml"
     path.write_text(example)
-    with pytest.raises(tasks.TaskError, match="YAML reads 1e-3 as text: write 1.0e-3"):
+    with pytest.raises(tasks.TaskError, match="YAML reads 1e-3 as text: write it with a decimal"):
         tasks.load(path)
     path.write_text(example.replace("1e-3", "1.0e-3"))
     problems = [p.id for p in specs.load_all(REPO / "problems")]
@@ -191,14 +216,43 @@ def test_a_file_that_cannot_be_read_is_reported_with_the_rest(task_data, write_t
     assert sum("cannot be read as UTF-8 text" in p for p in err.value.problems) == 2
 
 
-def test_a_task_under_another_suffix_is_not_skipped(task_data, write_task, tmp_path):
+@pytest.mark.parametrize("suffix", [".yml", ".YAML", ".Yml", ".YML"])
+def test_a_task_under_another_spelling_of_the_suffix_is_not_skipped(
+    task_data, write_task, tmp_path, suffix
+):
     # Skipped, a held-out task saved as .yml would pass the check that keeps
     # those out of the repository.
     task_data["split"] = "held_out"
     path = write_task(task_data)
-    path.rename(path.with_suffix(".yml"))
+    path.rename(path.with_suffix(suffix))
     with pytest.raises(tasks.TaskError, match="a task file ends in .yaml"):
         tasks.load_all(tmp_path / "tasks")
+
+
+def test_other_files_beside_the_tasks_are_left_alone(task_data, write_task, tmp_path):
+    path = write_task(task_data)
+    (path.parent / "README.md").write_text("notes")
+    (path.parent / "toy_peak.yaml.bak").write_text("id: [")
+    assert len(tasks.load_all(tmp_path / "tasks")) == 1
+
+
+def test_a_directory_of_tasks_that_is_not_there_is_refused(tmp_path):
+    # An empty list would let the check of the committed tasks pass on nothing.
+    with pytest.raises(tasks.TaskError, match="no such directory of tasks"):
+        tasks.load_all(tmp_path / "moved")
+    (tmp_path / "a_file").write_text("")
+    with pytest.raises(tasks.TaskError, match="no such directory of tasks"):
+        tasks.load_all(tmp_path / "a_file")
+
+
+def test_a_negative_reference_is_measured_by_its_size(task_data, write_task):
+    task_data["answer"][0].update(reference=-0.0412)
+    assert tasks.load(write_task(task_data)).value("peak_value").reference == -0.0412
+
+
+def test_an_absolute_tolerance_may_be_as_wide_as_the_task_needs(task_data, write_task):
+    task_data["answer"][1]["abs_tol"] = 5.0
+    assert tasks.load(write_task(task_data)).value("peak_time").abs_tol == 5.0
 
 
 def test_not_yaml_and_not_a_mapping_are_refused(tmp_path):
